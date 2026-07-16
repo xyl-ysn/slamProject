@@ -1,0 +1,24 @@
+llo 相关中间结果
+data/outputs/egoallo_inputs/*
+data/outputs/egoallo_outputs/*
+data/outputs/tmp/*
+data/outputs/thk/*
+
+# 第三方库源码
+third_party/*
+
+# =========================
+# 例外规则：保留目录结构
+# =========================
+!data/outputs/egoallo_inputs/.gitkeep
+!data/outputs/egoallo_outputs/.gitkeep
+!data/outputs/tmp/.gitkeep
+!data/outputs/thk/.gitkeep
+!third_party/.gitkeep
+# ========================= IDE =========================
+.idea/ .vscode/ *.swp *.swo
+# ========================= Python =========================
+__pycache__/ *.pyc *.pyo *.pyd .pytest_cache/ .mypy_cache/
+# ========================= OS =========================
+.DS_Store
+Thumbs.db
