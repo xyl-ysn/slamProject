@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Merge EgoAllo segmented NPZ outputs without modifying motion.
+Merge EgoAllo segmented NPZ outputs.
 
-This replaces the old smoothing-centered post-process when EgoAllo is run with
-"overlap inference + center crop".  The expected input is <output_dir>/ego_tmp,
-where each .npz already contains a non-overlapping target crop.  This script
-concatenates those crops, writes one visualization npz, and produces a quality
-report.  It deliberately does not smooth Ts_world_cpf, root, or body quats by
-default, because smoothing can hide real boundary issues and can worsen hand,
-foot, and floor constraints.
+The expected input is <output_dir>/ego_tmp, where each .npz contains the
+non-overlapping target crop produced by overlap inference + center crop.
+
+By default this script only concatenates those crops and reports boundary
+quality.  When --boundary-blend-frames is positive, it additionally applies a
+local interpolation window around each segment boundary.  The blend is limited
+to the requested boundary window so it does not globally smooth the motion.
 """
 from __future__ import annotations
 
@@ -78,6 +78,252 @@ def quat_angle_deg(q1, q2):
     q2 = normalize_quat(q2)
     dot = np.clip(np.abs(np.sum(q1 * q2, axis=-1)), -1.0, 1.0)
     return np.degrees(2 * np.arccos(dot))
+
+
+def slerp_quat(q0, q1, t, eps=1e-8):
+    q0 = normalize_quat(q0, eps=eps)
+    q1 = normalize_quat(q1, eps=eps)
+    dot = np.sum(q0 * q1, axis=-1, keepdims=True)
+    q1 = np.where(dot < 0.0, -q1, q1)
+    dot = np.clip(np.abs(dot), -1.0, 1.0)
+
+    t_arr = np.asarray(t, dtype=np.float64)
+    while t_arr.ndim < q0.ndim:
+        t_arr = np.expand_dims(t_arr, axis=-1)
+
+    linear = dot > 0.9995
+    theta_0 = np.arccos(dot)
+    sin_theta_0 = np.sin(theta_0)
+    theta = theta_0 * t_arr
+    sin_theta = np.sin(theta)
+
+    s0 = np.where(linear, 1.0 - t_arr, np.cos(theta) - dot * sin_theta / np.clip(sin_theta_0, eps, None))
+    s1 = np.where(linear, t_arr, sin_theta / np.clip(sin_theta_0, eps, None))
+    return normalize_quat(s0 * q0 + s1 * q1, eps=eps).astype(np.float32)
+
+
+def _odd_window(window: int) -> int:
+    window = int(window)
+    if window <= 1:
+        return 0
+    return window if window % 2 == 1 else window + 1
+
+
+def _window_bounds(i: int, n: int, window: int) -> tuple[int, int]:
+    half = window // 2
+    lo = max(0, i - half)
+    hi = min(n, i + half + 1)
+    return lo, hi
+
+
+def moving_average_time(arr: np.ndarray, axis: int, window: int) -> np.ndarray:
+    window = _odd_window(window)
+    if window <= 1:
+        return arr
+    moved = np.moveaxis(np.asarray(arr, dtype=np.float64), axis, 0)
+    out = np.empty_like(moved)
+    n = moved.shape[0]
+    for i in range(n):
+        lo, hi = _window_bounds(i, n, window)
+        out[i] = np.mean(moved[lo:hi], axis=0)
+    return np.moveaxis(out, 0, axis).astype(arr.dtype, copy=False)
+
+
+def median_filter_time(arr: np.ndarray, axis: int, window: int) -> np.ndarray:
+    window = _odd_window(window)
+    if window <= 1:
+        return arr
+    moved = np.moveaxis(np.asarray(arr), axis, 0)
+    out = np.empty_like(moved)
+    n = moved.shape[0]
+    for i in range(n):
+        lo, hi = _window_bounds(i, n, window)
+        out[i] = np.median(moved[lo:hi], axis=0)
+    return np.moveaxis(out, 0, axis).astype(arr.dtype, copy=False)
+
+
+def smooth_quat_time(arr: np.ndarray, axis: int, window: int) -> np.ndarray:
+    window = _odd_window(window)
+    if window <= 1 or arr.shape[-1] != 4:
+        return arr
+    moved = np.moveaxis(normalize_quat(arr), axis, 0)
+    out = np.empty_like(moved)
+    n = moved.shape[0]
+    for i in range(n):
+        lo, hi = _window_bounds(i, n, window)
+        qs = moved[lo:hi]
+        ref = moved[i]
+        signs = np.where(np.sum(qs * np.expand_dims(ref, axis=0), axis=-1, keepdims=True) < 0.0, -1.0, 1.0)
+        out[i] = normalize_quat(np.mean(qs * signs, axis=0))
+    return np.moveaxis(out.astype(np.float32), 0, axis)
+
+
+def lowpass_quat_time(arr: np.ndarray, axis: int, alpha: float) -> np.ndarray:
+    alpha = float(alpha)
+    if alpha <= 0.0 or arr.shape[-1] != 4:
+        return arr
+    alpha = min(alpha, 1.0)
+    moved = np.moveaxis(normalize_quat(arr), axis, 0)
+    out = np.empty_like(moved)
+    out[0] = moved[0]
+    for i in range(1, moved.shape[0]):
+        out[i] = slerp_quat(out[i - 1], moved[i], alpha)
+    return np.moveaxis(out.astype(np.float32), 0, axis)
+
+
+def _time_axis_for_array(key: str, arr: np.ndarray, num_samples: int) -> int | None:
+    if key in SAMPLE_TIME_KEYS and arr.ndim >= 2 and arr.shape[0] == num_samples:
+        return 1
+    if key == "Ts_world_cpf" and arr.ndim >= 2:
+        return 0
+    return None
+
+
+def _time_length(arr: np.ndarray, axis: int) -> int:
+    return int(arr.shape[axis])
+
+
+def _take_time(arr: np.ndarray, axis: int, index: int) -> np.ndarray:
+    return np.take(arr, index, axis=axis)
+
+
+def _assign_time_range(arr: np.ndarray, axis: int, lo: int, hi: int, values: np.ndarray) -> None:
+    sl = [slice(None)] * arr.ndim
+    sl[axis] = slice(lo, hi)
+    arr[tuple(sl)] = values
+
+
+def _interpolate_quat_time_range(arr: np.ndarray, axis: int, lo: int, hi: int) -> bool:
+    if arr.shape[-1] != 4 or hi - lo < 2:
+        return False
+    q0 = _take_time(arr, axis, lo)
+    q1 = _take_time(arr, axis, hi - 1)
+    n = hi - lo
+    alpha = np.linspace(0.0, 1.0, n, dtype=np.float64)
+    shape = [1] * arr.ndim
+    shape[axis] = n
+    alpha = alpha.reshape(shape[:-1])
+    values = slerp_quat(np.expand_dims(q0, axis=axis), np.expand_dims(q1, axis=axis), alpha)
+    _assign_time_range(arr, axis, lo, hi, values)
+    return True
+
+
+def _interpolate_pose7_time_range(arr: np.ndarray, axis: int, lo: int, hi: int) -> bool:
+    if arr.shape[-1] != 7 or hi - lo < 2:
+        return False
+    p0 = _take_time(arr, axis, lo)
+    p1 = _take_time(arr, axis, hi - 1)
+    n = hi - lo
+    alpha_1d = np.linspace(0.0, 1.0, n, dtype=np.float64)
+    quat_shape = [1] * arr.ndim
+    quat_shape[axis] = n
+    alpha_quat = alpha_1d.reshape(quat_shape[:-1])
+    trans_shape = [1] * arr.ndim
+    trans_shape[axis] = n
+    alpha_trans = alpha_1d.reshape(trans_shape)
+
+    q = slerp_quat(
+        np.expand_dims(p0[..., :4], axis=axis),
+        np.expand_dims(p1[..., :4], axis=axis),
+        alpha_quat,
+    )
+    t = (1.0 - alpha_trans) * np.expand_dims(p0[..., 4:7], axis=axis) + alpha_trans * np.expand_dims(p1[..., 4:7], axis=axis)
+    _assign_time_range(arr, axis, lo, hi, np.concatenate([q, t.astype(np.float32)], axis=-1))
+    return True
+
+
+def apply_boundary_blend(out: dict[str, np.ndarray], boundaries: list[int], blend_frames: int) -> list[dict[str, Any]]:
+    if blend_frames <= 0 or not boundaries:
+        return []
+
+    num_samples = int(out["body_quats"].shape[0]) if "body_quats" in out and out["body_quats"].ndim >= 2 else 1
+    blend_keys = (
+        "Ts_world_root",
+        "body_quats",
+        "left_hand_quats",
+        "right_hand_quats",
+    )
+    reports: list[dict[str, Any]] = []
+    for boundary in boundaries:
+        item: dict[str, Any] = {"boundary_index": int(boundary), "requested_frames": int(blend_frames), "applied": {}}
+        for key in blend_keys:
+            arr = out.get(key)
+            if arr is None:
+                continue
+            axis = _time_axis_for_array(key, arr, num_samples)
+            if axis is None:
+                continue
+            T = _time_length(arr, axis)
+            radius = min(int(blend_frames), int(boundary), int(T - boundary))
+            if radius <= 0:
+                item["applied"][key] = {"frames": 0, "reason": "boundary_too_close_to_sequence_edge"}
+                continue
+            lo = int(boundary - radius)
+            hi = int(boundary + radius)
+            if arr.shape[-1] == 7:
+                changed = _interpolate_pose7_time_range(arr, axis, lo, hi)
+            elif arr.shape[-1] == 4:
+                changed = _interpolate_quat_time_range(arr, axis, lo, hi)
+            else:
+                changed = False
+            item["applied"][key] = {"frames": int(hi - lo) if changed else 0, "range": [lo, hi]}
+        reports.append(item)
+    return reports
+
+
+def apply_global_smoothing(
+    out: dict[str, np.ndarray],
+    *,
+    translation_smooth_window: int,
+    quat_lowpass_alpha: float,
+) -> dict[str, Any]:
+    num_samples = int(out["body_quats"].shape[0]) if "body_quats" in out and out["body_quats"].ndim >= 2 else 1
+    report: dict[str, Any] = {
+        "translation_smooth_window": int(translation_smooth_window),
+        "quat_lowpass_alpha": float(quat_lowpass_alpha),
+        "applied": {},
+    }
+
+    root = out.get("Ts_world_root")
+    if root is not None:
+        axis = _time_axis_for_array("Ts_world_root", root, num_samples)
+        if axis is not None and root.shape[-1] == 7:
+            changed = False
+            smoothed = root.copy()
+            if _odd_window(translation_smooth_window) > 1:
+                trans = np.take(smoothed, indices=range(4, 7), axis=smoothed.ndim - 1)
+                smoothed[..., 4:7] = moving_average_time(trans, axis, translation_smooth_window)
+                changed = True
+            if quat_lowpass_alpha > 0.0:
+                smoothed[..., :4] = lowpass_quat_time(smoothed[..., :4], axis, quat_lowpass_alpha)
+                changed = True
+            if changed:
+                out["Ts_world_root"] = smoothed.astype(root.dtype, copy=False)
+            report["applied"]["Ts_world_root"] = {
+                "changed": bool(changed),
+                "time_axis": int(axis),
+                "frames": int(_time_length(root, axis)),
+            }
+
+    body = out.get("body_quats")
+    if body is not None:
+        axis = _time_axis_for_array("body_quats", body, num_samples)
+        changed = axis is not None and quat_lowpass_alpha > 0.0
+        if changed:
+            out["body_quats"] = lowpass_quat_time(body, axis, quat_lowpass_alpha).astype(body.dtype, copy=False)
+        report["applied"]["body_quats"] = {"changed": bool(changed), "alpha": float(quat_lowpass_alpha)}
+
+    for key in ("left_hand_quats", "right_hand_quats"):
+        arr = out.get(key)
+        if arr is None:
+            continue
+        axis = _time_axis_for_array(key, arr, num_samples)
+        changed = axis is not None and quat_lowpass_alpha > 0.0
+        if changed:
+            out[key] = lowpass_quat_time(arr, axis, quat_lowpass_alpha).astype(arr.dtype, copy=False)
+        report["applied"][key] = {"changed": bool(changed), "alpha": float(quat_lowpass_alpha)}
+
+    return report
 
 
 def load_segments(input_dir: Path):
@@ -226,8 +472,6 @@ def main():
     ap.add_argument("--print-stats", action="store_true")
     ap.add_argument("--strict-frame-continuity", action="store_true")
 
-    # Backward-compatible arguments from the old smoother.  They are accepted but
-    # intentionally not applied unless you restore a separate smoothing stage.
     ap.add_argument("--boundary-blend-frames", type=int, default=0)
     ap.add_argument("--translation-smooth-window", type=int, default=0)
     ap.add_argument("--quat-lowpass-alpha", type=float, default=0.0)
@@ -236,29 +480,32 @@ def main():
     input_dir = args.input_dir.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
 
-    if args.boundary_blend_frames or args.translation_smooth_window or args.quat_lowpass_alpha:
-        print(
-            "[Warning] 06_merge_egoallo_segments.py is merge-only. "
-            "boundary/translation/quaternion smoothing arguments are ignored. "
-            "Use overlap inference + center crop to reduce boundary artifacts instead.",
-            flush=True,
-        )
-
     segs, paths, segment_info = load_segments(input_dir)
     out = concat_segments(segs)
     boundaries = boundaries_from_segment_info(segment_info)
     continuity = frame_continuity_report(segment_info)
-    boundary_reports = boundary_quality(out, boundaries)
+    boundary_reports_before = boundary_quality(out, boundaries)
+    boundary_blend_report = apply_boundary_blend(out, boundaries, int(args.boundary_blend_frames))
+    global_smoothing_report = apply_global_smoothing(
+        out,
+        translation_smooth_window=int(args.translation_smooth_window),
+        quat_lowpass_alpha=float(args.quat_lowpass_alpha),
+    )
+    boundary_reports_after = boundary_quality(out, boundaries)
 
     if args.print_stats:
-        print_report(segment_info, continuity, boundary_reports)
+        print_report(segment_info, continuity, boundary_reports_after)
 
     if args.strict_frame_continuity and not continuity["continuous"]:
         raise ValueError(f"Frame continuity check failed: {continuity['issues']}")
 
     out["merge_segment_boundaries"] = np.asarray(boundaries, dtype=np.int64)
     out["merge_segment_lengths"] = np.asarray([int(x["length"]) for x in segment_info], dtype=np.int64)
-    out["merge_is_smoothed"] = np.asarray(False)
+    any_global_smoothing = _odd_window(int(args.translation_smooth_window)) > 1 or float(args.quat_lowpass_alpha) > 0.0
+    out["merge_is_smoothed"] = np.asarray(int(args.boundary_blend_frames) > 0 or any_global_smoothing)
+    out["merge_boundary_blend_frames"] = np.asarray(int(args.boundary_blend_frames), dtype=np.int64)
+    out["merge_translation_smooth_window"] = np.asarray(int(args.translation_smooth_window), dtype=np.int64)
+    out["merge_quat_lowpass_alpha"] = np.asarray(float(args.quat_lowpass_alpha), dtype=np.float32)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / args.output_name
@@ -266,19 +513,26 @@ def main():
 
     report = {
         "status": "ok" if continuity["continuous"] else "warning",
-        "mode": "merge_only_no_smoothing",
+        "mode": "boundary_blend_global_smoothing"
+        if int(args.boundary_blend_frames) > 0 and any_global_smoothing
+        else "global_smoothing"
+        if any_global_smoothing
+        else "boundary_blend"
+        if int(args.boundary_blend_frames) > 0
+        else "merge_only_no_smoothing",
         "input_dir": str(input_dir),
         "output_npz": str(out_path),
         "num_segments": len(segment_info),
         "segments": segment_info,
         "frame_continuity": continuity,
         "boundaries": boundaries,
-        "boundary_quality": boundary_reports,
-        "ignored_smoothing_args": {
+        "boundary_quality_before": boundary_reports_before,
+        "boundary_quality": boundary_reports_after,
+        "boundary_blend": {
             "boundary_blend_frames": int(args.boundary_blend_frames),
-            "translation_smooth_window": int(args.translation_smooth_window),
-            "quat_lowpass_alpha": float(args.quat_lowpass_alpha),
+            "applied": boundary_blend_report,
         },
+        "global_smoothing": global_smoothing_report,
     }
 
     report_json = args.report_json
@@ -290,7 +544,15 @@ def main():
         print(f"Saved merge quality report: {report_json}")
 
     print(f"Saved merged EgoAllo output: {out_path}")
-    print("Mode: merge-only; no smoothing was applied.")
+    if int(args.boundary_blend_frames) > 0 or any_global_smoothing:
+        print(
+            "Mode: "
+            f"boundary_blend={int(args.boundary_blend_frames)}, "
+            f"translation_window={int(args.translation_smooth_window)}, "
+            f"quat_lowpass_alpha={float(args.quat_lowpass_alpha):.3f}"
+        )
+    else:
+        print("Mode: merge-only; no smoothing was applied.")
 
 
 if __name__ == "__main__":

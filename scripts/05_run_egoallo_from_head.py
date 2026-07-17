@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -154,6 +156,26 @@ class Args:
     expected_head_height_min: float = 1.0
     expected_head_height_max: float = 2.2
 
+    parallel_workers: int = 1
+    """Number of separate worker processes to run EgoAllo segments in parallel."""
+
+    available_vram_gb: float = 0.0
+    """VRAM budget for concurrent EgoAllo workers. <=0 disables memory-budget scheduling."""
+
+    estimated_model_vram_gb: float = 6.0
+    """Conservative fixed VRAM estimate for one EgoAllo worker process."""
+
+    estimated_vram_gb_per_frame: float = 0.020
+    """Conservative extra VRAM estimate per inference frame."""
+
+    worker_task_file: Path | None = None
+    worker_segment_index: int | None = None
+    worker_target_start: int | None = None
+    worker_target_end: int | None = None
+    worker_infer_start: int | None = None
+    worker_infer_end: int | None = None
+    worker_crop_offset: int | None = None
+
 
 T_CAMERA_CPF = np.array(
     [
@@ -260,6 +282,359 @@ def maybe_slice_hamer(all_hamer, hamer_path: Path, pose_timesteps: torch.Tensor,
     pose_timesteps_np = pose_timesteps.detach().cpu().numpy()
     segment_ts = tuple(float(x) for x in pose_timesteps_np[start + 1 : start + length + 1])
     return CorrespondedHamerDetections.load(hamer_path, segment_ts).to(device)
+
+
+@dataclasses.dataclass(frozen=True)
+class SegmentTask:
+    segment_index: int
+    target_start: int
+    target_end: int
+    infer_start: int
+    infer_end: int
+    crop_offset: int
+
+    @property
+    def target_length(self) -> int:
+        return int(self.target_end - self.target_start)
+
+    @property
+    def infer_length(self) -> int:
+        return int(self.infer_end - self.infer_start)
+
+
+def build_segment_tasks(args: Args, max_output_frames: int) -> tuple[list[SegmentTask], int]:
+    final_end = max_output_frames if args.end_index is None else min(args.end_index, max_output_frames)
+    if final_end <= args.start_index:
+        raise ValueError(f"end_index must be > start_index, got {final_end} <= {args.start_index}")
+
+    tasks: list[SegmentTask] = []
+    segment_index = int(args.segment_index_offset)
+    start = int(args.start_index)
+    while start < final_end:
+        target_start = start
+        target_length = min(int(args.traj_length), final_end - target_start)
+        target_end = target_start + target_length
+
+        if args.save_only_center and args.context_frames > 0:
+            infer_start = max(args.start_index, target_start - args.context_frames)
+            infer_end = min(final_end, target_end + args.context_frames)
+        else:
+            infer_start = target_start
+            infer_end = target_end
+
+        tasks.append(SegmentTask(
+            segment_index=segment_index,
+            target_start=target_start,
+            target_end=target_end,
+            infer_start=infer_start,
+            infer_end=infer_end,
+            crop_offset=target_start - infer_start,
+        ))
+
+        start = target_end
+        segment_index += 1
+
+    return tasks, final_end
+
+
+def worker_task_from_args(args: Args) -> SegmentTask | None:
+    fields = (
+        args.worker_segment_index,
+        args.worker_target_start,
+        args.worker_target_end,
+        args.worker_infer_start,
+        args.worker_infer_end,
+        args.worker_crop_offset,
+    )
+    if all(v is None for v in fields):
+        return None
+    if any(v is None for v in fields):
+        raise ValueError("Worker segment args must be provided together.")
+    return SegmentTask(
+        segment_index=int(args.worker_segment_index),
+        target_start=int(args.worker_target_start),
+        target_end=int(args.worker_target_end),
+        infer_start=int(args.worker_infer_start),
+        infer_end=int(args.worker_infer_end),
+        crop_offset=int(args.worker_crop_offset),
+    )
+
+
+def _parse_worker_tasks_file(worker_task_path: Path) -> list[SegmentTask]:
+    with worker_task_path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        tasks_payload = data.get("tasks", [])
+    else:
+        tasks_payload = data
+
+    if not isinstance(tasks_payload, list):
+        raise ValueError(f"worker task file must contain a list, got {type(tasks_payload)}: {worker_task_path}")
+    tasks: list[SegmentTask] = []
+    for i, item in enumerate(tasks_payload):
+        if not isinstance(item, dict):
+            raise ValueError(f"worker task entry {i} must be a dict: {item!r}")
+        required = (
+            "segment_index",
+            "target_start",
+            "target_end",
+            "infer_start",
+            "infer_end",
+            "crop_offset",
+        )
+        missing = [k for k in required if k not in item]
+        if missing:
+            raise ValueError(f"worker task entry {i} missing keys {missing} in {worker_task_path}")
+        tasks.append(
+            SegmentTask(
+                segment_index=int(item["segment_index"]),
+                target_start=int(item["target_start"]),
+                target_end=int(item["target_end"]),
+                infer_start=int(item["infer_start"]),
+                infer_end=int(item["infer_end"]),
+                crop_offset=int(item["crop_offset"]),
+            )
+        )
+    return tasks
+
+
+def worker_tasks_from_args(args: Args) -> list[SegmentTask] | None:
+    task_file = args.worker_task_file
+    task_from_args = worker_task_from_args(args)
+
+    if task_file is not None and task_from_args is not None:
+        raise ValueError("Provide only worker_task_file or worker_segment_* args, not both.")
+
+    if task_file is not None:
+        if not task_file.exists():
+            raise FileNotFoundError(f"worker task file not found: {task_file}")
+        return _parse_worker_tasks_file(task_file)
+
+    if task_from_args is not None:
+        return [task_from_args]
+    return None
+
+
+def estimate_segment_vram_gb(args: Args, task: SegmentTask) -> float:
+    return float(args.estimated_model_vram_gb) + float(args.estimated_vram_gb_per_frame) * float(task.infer_length)
+
+
+def estimate_worker_vram_gb(args: Args, tasks: list[SegmentTask]) -> float:
+    if not tasks:
+        return 0.0
+    return max(estimate_segment_vram_gb(args, task) for task in tasks)
+
+
+def _append_bool_arg(cmd: list[str], name: str, value: bool) -> None:
+    cmd.append(f"--{name}" if bool(value) else f"--no-{name}")
+
+
+def build_worker_command(args: Args, tasks: list[SegmentTask], worker_task_file: Path | None = None) -> list[str]:
+    cmd = [
+        sys.executable,
+        str(SCRIPT_PATH),
+        "--traj-root", str(args.traj_root),
+        "--output-dir", str(args.output_dir),
+        "--checkpoint-dir", str(args.checkpoint_dir),
+        "--model-config-path", str(args.model_config_path),
+        "--smplh-npz-path", str(args.smplh_npz_path),
+        "--glasses-x-angle-offset", str(args.glasses_x_angle_offset),
+        "--traj-length", str(args.traj_length),
+        "--context-frames", str(args.context_frames),
+        "--start-index", str(args.start_index),
+        "--segment-index-offset", str(args.segment_index_offset),
+        "--num-samples", str(args.num_samples),
+        "--guidance-mode", str(args.guidance_mode),
+        "--floor-z", str(args.floor_z),
+        "--expected-head-height-min", str(args.expected_head_height_min),
+        "--expected-head-height-max", str(args.expected_head_height_max),
+        "--parallel-workers", "1",
+        "--available-vram-gb", "0",
+        "--estimated-model-vram-gb", str(args.estimated_model_vram_gb),
+        "--estimated-vram-gb-per-frame", str(args.estimated_vram_gb_per_frame),
+    ]
+    if args.hamer_outputs_path is not None:
+        cmd.extend(["--hamer-outputs-path", str(args.hamer_outputs_path)])
+    if args.end_index is not None:
+        cmd.extend(["--end-index", str(args.end_index)])
+    _append_bool_arg(cmd, "save-only-center", args.save_only_center)
+    _append_bool_arg(cmd, "guidance-inner", args.guidance_inner)
+    _append_bool_arg(cmd, "guidance-post", args.guidance_post)
+    _append_bool_arg(cmd, "save-traj", args.save_traj)
+    _append_bool_arg(cmd, "save-args", args.save_args)
+    if args.empty_cache_each_segment:
+        cmd.append("--empty-cache-each-segment")
+    if args.allow_tf32:
+        cmd.append("--allow-tf32")
+
+    if worker_task_file is not None:
+        cmd.extend(["--worker-task-file", str(worker_task_file)])
+    elif len(tasks) == 1:
+        task = tasks[0]
+        cmd.extend(
+            [
+                "--worker-segment-index",
+                str(task.segment_index),
+                "--worker-target-start",
+                str(task.target_start),
+                "--worker-target-end",
+                str(task.target_end),
+                "--worker-infer-start",
+                str(task.infer_start),
+                "--worker-infer-end",
+                str(task.infer_end),
+                "--worker-crop-offset",
+                str(task.crop_offset),
+            ]
+        )
+    else:
+        raise ValueError("build_worker_command requires either worker_task_file or one worker task.")
+    return cmd
+
+
+def _write_worker_task_file(output_dir: Path, worker_id: int, tasks: list[SegmentTask]) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    task_path = output_dir / f"__egoallo_worker_{worker_id}_tasks.json"
+    payload = [dataclasses.asdict(task) for task in tasks]
+    task_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return task_path
+
+
+def run_parallel_coordinator(args: Args) -> None:
+    head_path = args.traj_root / "head_trajectory.npy"
+    if not head_path.exists():
+        raise FileNotFoundError(head_path)
+    T_np = np.load(head_path, mmap_mode="r")
+    if T_np.ndim != 3 or T_np.shape[1:] != (4, 4):
+        raise ValueError(f"head_trajectory.npy should be [N,4,4], got {T_np.shape}")
+    max_output_frames = int(T_np.shape[0] - 1)
+    if args.start_index < 0 or args.start_index >= max_output_frames:
+        raise ValueError(f"start_index must be in [0, {max_output_frames - 1}], got {args.start_index}")
+
+    tasks, final_end = build_segment_tasks(args, max_output_frames)
+    max_workers = max(1, int(args.parallel_workers))
+    budget = float(args.available_vram_gb)
+
+    print(f"{T_np.shape=}")
+    print(f"total output frames={max_output_frames}, run range=[{args.start_index}, {final_end})")
+    print(f"target segment length={args.traj_length}")
+    print(f"context frames={args.context_frames}, save_only_center={args.save_only_center}")
+    print(f"parallel_workers={max_workers}, available_vram_gb={budget:.3f}")
+    print(
+        "VRAM estimate: "
+        f"{args.estimated_model_vram_gb:.3f} GB/process + "
+        f"{args.estimated_vram_gb_per_frame:.4f} GB/frame"
+    )
+
+    if budget > 0:
+        for task in tasks:
+            est = estimate_segment_vram_gb(args, task)
+            if est > budget:
+                raise RuntimeError(
+                    f"Segment {task.segment_index} estimated VRAM {est:.3f} GB exceeds "
+                    f"available_vram_gb={budget:.3f}. Reduce segment/context length or increase budget."
+                )
+
+    if not tasks:
+        print("[EgoAllo parallel] no tasks to run.")
+        return
+
+    num_workers = min(max_workers, len(tasks))
+    task_groups: list[list[SegmentTask]] = [[] for _ in range(num_workers)]
+    for i, task in enumerate(tasks):
+        task_groups[i % num_workers].append(task)
+    task_groups = [g for g in task_groups if g]
+
+    pending = []
+    for worker_idx, group in enumerate(task_groups):
+        est = estimate_worker_vram_gb(args, group)
+        if budget > 0 and est > budget:
+            raise RuntimeError(
+                f"Worker {worker_idx} estimated VRAM {est:.3f} GB exceeds "
+                f"available_vram_gb={budget:.3f} for task batch."
+            )
+        worker_task_file = _write_worker_task_file(
+            Path(args.output_dir) if args.output_dir is not None else args.traj_root / "ego_tmp",
+            worker_idx,
+            group,
+        )
+        target_summary = f"{group[0].target_start}-{group[-1].target_end}"
+        infer_summary = f"{group[0].infer_start}-{group[-1].infer_end}"
+        pending.append({
+            "worker_id": int(worker_idx),
+            "tasks": group,
+            "task_file": worker_task_file,
+            "worker_vram": float(est),
+            "summary": f"segment={group[0].segment_index}-{group[-1].segment_index}, target={target_summary}, infer={infer_summary}",
+        })
+
+    running: list[dict[str, object]] = []
+    completed = 0
+    temp_files: set[Path] = {item["task_file"] for item in pending}
+
+    while pending or running:
+        still_running = []
+        for item in running:
+            proc = item["proc"]
+            assert isinstance(proc, subprocess.Popen)
+            code = proc.poll()
+            if code is None:
+                still_running.append(item)
+                continue
+            if code != 0:
+                raise subprocess.CalledProcessError(code, item["cmd"])
+            task_count = len(item["tasks"]) if isinstance(item["tasks"], list) else 0
+            completed += task_count
+            summary = item["summary"] if isinstance(item["summary"], str) else ""
+            print(
+                f"[EgoAllo parallel] completed worker {item['worker_id']} ({completed}/{len(tasks)} segments). "
+                f"{summary}",
+                flush=True,
+            )
+        running = still_running
+
+        used_vram = sum(float(item["worker_vram"]) for item in running)
+        launched = False
+        while pending and len(running) < max_workers:
+            item = pending[0]
+            est = float(item["worker_vram"])
+            if budget > 0 and used_vram + est > budget:
+                break
+            pending.pop(0)
+            task_file = item["task_file"]
+            assert isinstance(task_file, Path)
+            cmd = build_worker_command(args, item["tasks"], task_file)
+            print(
+                f"[EgoAllo parallel] launch worker {item['worker_id']}: "
+                f"{item['summary']} "
+                f"estimated_vram={est:.3f}GB used_after={used_vram + est:.3f}GB",
+                flush=True,
+            )
+            proc = subprocess.Popen(cmd, env=os.environ.copy())
+            running.append(
+                {
+                    "proc": proc,
+                    "worker_id": item["worker_id"],
+                    "tasks": item["tasks"],
+                    "worker_vram": item["worker_vram"],
+                    "summary": item["summary"],
+                    "task_file": item["task_file"],
+                    "cmd": cmd,
+                }
+            )
+            used_vram += est
+            launched = True
+
+        if not launched and running:
+            time.sleep(1.0)
+        elif pending and not running:
+            raise RuntimeError("No EgoAllo worker could be launched under the current VRAM budget.")
+    # cleanup coordinator-generated task files
+    for f in temp_files:
+        if f.is_file():
+            f.unlink(missing_ok=True)
+
+    print("\nDone.")
 
 
 
@@ -382,6 +757,10 @@ def main(args: Args) -> None:
         raise ValueError(f"traj_length must be positive, got {args.traj_length}")
     if args.context_frames < 0:
         raise ValueError(f"context_frames must be >= 0, got {args.context_frames}")
+    worker_tasks = worker_tasks_from_args(args)
+    if worker_tasks is None and int(args.parallel_workers) > 1:
+        run_parallel_coordinator(args)
+        return
 
     device = torch.device("cuda")
     torch.set_grad_enabled(False)
@@ -400,10 +779,29 @@ def main(args: Args) -> None:
     if final_end <= args.start_index:
         raise ValueError(f"end_index must be > start_index, got {final_end} <= {args.start_index}")
 
+    if worker_tasks is not None:
+        tasks = worker_tasks
+        final_end_for_log = max(task.target_end for task in tasks)
+        if args.start_index < 0 or args.start_index >= tasks[0].infer_start + 1:
+            raise ValueError(f"start_index should not be inconsistent with worker task definitions: {args.start_index}")
+        if final_end_for_log <= args.start_index:
+            raise ValueError(
+                f"worker tasks final end must be > start_index, got {final_end_for_log} <= {args.start_index}"
+            )
+    else:
+        tasks, final_end_for_log = build_segment_tasks(args, max_output_frames)
+
     print(f"{T_world_head.shape=}")
-    print(f"total output frames={max_output_frames}, run range=[{args.start_index}, {final_end})")
+    print(f"total output frames={max_output_frames}, run range=[{args.start_index}, {final_end_for_log})")
     print(f"target segment length={args.traj_length}")
     print(f"context frames={args.context_frames}, save_only_center={args.save_only_center}")
+    if worker_tasks is not None and len(worker_tasks) == 1:
+        worker_task = worker_tasks[0]
+        print(
+            f"worker segment={worker_task.segment_index} "
+            f"target={worker_task.target_start}-{worker_task.target_end} "
+            f"infer={worker_task.infer_start}-{worker_task.infer_end}"
+        )
 
     T_camera_cpf = torch.from_numpy(T_CAMERA_CPF).to(device)
     T_world_cpf_all = T_world_head @ T_camera_cpf
@@ -440,7 +838,8 @@ def main(args: Args) -> None:
     body_model = fncsmpl.SmplhModel.load(smplh_npz_path).to(device)
     print(f"  loaded in {time.time() - t0:.2f}s")
 
-    if args.hamer_outputs_path is not None:
+    worker_mode = worker_tasks is not None
+    if args.hamer_outputs_path is not None and not worker_mode:
         if not args.hamer_outputs_path.is_file():
             raise FileNotFoundError(args.hamer_outputs_path)
         if args.guidance_mode == "no_hands":
@@ -453,6 +852,15 @@ def main(args: Args) -> None:
         all_pose_ts = tuple(float(x) for x in pose_timesteps_np[1:])
         all_hamer = CorrespondedHamerDetections.load(args.hamer_outputs_path, all_pose_ts)
         print(f"  loaded in {time.time() - t0:.2f}s")
+    elif args.hamer_outputs_path is not None and worker_mode:
+        if not args.hamer_outputs_path.is_file():
+            raise FileNotFoundError(args.hamer_outputs_path)
+        if args.guidance_mode == "no_hands":
+            raise ValueError("--hamer-outputs-path was provided, but --guidance-mode=no-hands would ignore it.")
+        print("\n[Worker mode] Load HaMeR detections once for all assigned segments.")
+        pose_timesteps_np = pose_timesteps.detach().cpu().numpy()
+        all_pose_ts = tuple(float(x) for x in pose_timesteps_np[1:])
+        all_hamer = CorrespondedHamerDetections.load(args.hamer_outputs_path, all_pose_ts)
     else:
         if args.guidance_mode in ("hamer_wrist", "hamer_reproj2", "aria_hamer"):
             raise ValueError(f"--guidance-mode={args.guidance_mode} requires --hamer-outputs-path.")
@@ -460,24 +868,16 @@ def main(args: Args) -> None:
         print("No HaMeR/HaWoR detections provided.")
 
     aria_detections = None
-    segment_index = args.segment_index_offset
-    start = args.start_index
 
-    while start < final_end:
-        target_start = start
-        target_length = min(args.traj_length, final_end - target_start)
-        target_end = target_start + target_length
-
-        if args.save_only_center and args.context_frames > 0:
-            infer_start = max(args.start_index, target_start - args.context_frames)
-            infer_end = min(final_end, target_end + args.context_frames)
-        else:
-            infer_start = target_start
-            infer_end = target_end
-
-        infer_length = infer_end - infer_start
-        crop_offset = target_start - infer_start
-
+    for task in tasks:
+        target_start = task.target_start
+        target_end = task.target_end
+        target_length = task.target_length
+        infer_start = task.infer_start
+        infer_end = task.infer_end
+        infer_length = task.infer_length
+        crop_offset = task.crop_offset
+        segment_index = task.segment_index
         print("\n========================================")
         print(
             f"Segment {segment_index} | target={target_start}-{target_end} "
@@ -494,7 +894,7 @@ def main(args: Args) -> None:
         pose_timestamps_sec = pose_timesteps[infer_start + 1 : infer_start + infer_length + 1]
 
         hamer_detections = None
-        if all_hamer is not None:
+        if args.hamer_outputs_path is not None:
             hamer_detections = maybe_slice_hamer(
                 all_hamer,
                 args.hamer_outputs_path,
@@ -537,9 +937,6 @@ def main(args: Args) -> None:
         del traj, hamer_detections
         if args.empty_cache_each_segment:
             torch.cuda.empty_cache()
-
-        start = target_end
-        segment_index += 1
 
     print("\nDone.")
 

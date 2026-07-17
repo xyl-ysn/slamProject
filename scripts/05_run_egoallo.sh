@@ -5,7 +5,7 @@ set -euo pipefail
 # 说明：
 #   traj_root:          EgoAllo 输入目录，里面需要有 head_trajectory.npy / timestamps.txt / hamer_outputs.pkl
 #   segment_output_dir: EgoAllo 分段输出目录，保存每段 .npz 和 _args.yaml；本项目传入 <output_dir>/ego_tmp
-#   traj_length:        分段长度。通常由 run_body_mesh.py 从 config/body_mesh.yaml 的 egoallo.segment_length 传入。
+#   traj_length:        分段长度。通常由 run_body_mesh.py 从 config/body_mesh.yaml 的 egoallo.target_segment_length 传入。
 #
 # 本脚本不读取 YAML，只读取 run_body_mesh.py 注入的环境变量，并转成
 # 05_run_egoallo_from_head.py 的命令行参数。
@@ -110,6 +110,10 @@ CMD=(
     --floor-z "${EGOALLO_FLOOR_Z:-0.0}"
     --expected-head-height-min "${EGOALLO_EXPECTED_HEAD_HEIGHT_MIN:-1.0}"
     --expected-head-height-max "${EGOALLO_EXPECTED_HEAD_HEIGHT_MAX:-2.2}"
+    --parallel-workers "${EGOALLO_PARALLEL_WORKERS:-1}"
+    --available-vram-gb "${EGOALLO_AVAILABLE_VRAM_GB:-0}"
+    --estimated-model-vram-gb "${EGOALLO_ESTIMATED_MODEL_VRAM_GB:-6.0}"
+    --estimated-vram-gb-per-frame "${EGOALLO_ESTIMATED_VRAM_GB_PER_FRAME:-0.020}"
 )
 
 if [ -n "${EGOALLO_END_INDEX:-}" ]; then

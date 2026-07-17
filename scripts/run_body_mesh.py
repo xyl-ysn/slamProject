@@ -194,6 +194,50 @@ def remove_dir_if_requested(name: str, path: Path, enabled: bool) -> dict[str, A
     return result
 
 
+def cleanup_existing_scripts_pycache(enabled: bool) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "requested": bool(enabled),
+        "root": str(SCRIPTS_DIR),
+        "deleted": [],
+    }
+    if not enabled:
+        result["reason"] = "disabled"
+        return result
+
+    for pycache_dir in sorted(SCRIPTS_DIR.rglob("__pycache__")):
+        if not pycache_dir.is_dir():
+            continue
+        shutil.rmtree(pycache_dir)
+        result["deleted"].append(str(pycache_dir))
+
+    result["reason"] = "deleted_existing_scripts_pycache" if result["deleted"] else "not_found"
+    return result
+
+
+def configure_python_pycache(env: dict[str, str], cfg: dict[str, Any], tmp_dir: Path) -> tuple[Path | None, dict[str, Any]]:
+    """Redirect Python bytecode cache away from the source tree.
+
+    PYTHONPYCACHEPREFIX is read by each child Python process at startup. Setting
+    sys.pycache_prefix here also keeps any later imports in the coordinator from
+    writing __pycache__ directories under scripts/.
+    """
+    cleanup_result = cleanup_existing_scripts_pycache(
+        _cfg_bool(get_cfg(cfg, "python_cache.cleanup_existing_scripts_pycache", True), default=True)
+    )
+    enabled = _cfg_bool(get_cfg(cfg, "python_cache.redirect_pycache_to_tmp", True), default=True)
+    if not enabled:
+        env.pop("PYTHONPYCACHEPREFIX", None)
+        return None, cleanup_result
+
+    cache_subdir = str(get_cfg(cfg, "python_cache.pycache_subdir", "pycache"))
+    cache_dir = (tmp_dir / cache_subdir).expanduser().resolve()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    env["PYTHONPYCACHEPREFIX"] = str(cache_dir)
+    sys.pycache_prefix = str(cache_dir)
+    print(f"[Python] pycache redirected to: {cache_dir}", flush=True)
+    return cache_dir, cleanup_result
+
+
 def configure_jax_compilation_cache(env: dict[str, str], cfg: dict[str, Any], tmp_dir: Path) -> Path | None:
     """Enable JAX persistent compilation cache under <output_dir>/tmp.
 
@@ -393,6 +437,9 @@ def main() -> None:
     egoallo_outputs_dir.mkdir(parents=True, exist_ok=True)
     ego_tmp_dir.mkdir(parents=True, exist_ok=True)
 
+    # Keep Python bytecode cache out of project source directories.
+    python_pycache_dir, python_pycache_cleanup = configure_python_pycache(env, cfg, tmp_dir)
+
     # JAX guidance persistent compilation cache lives under <output_dir>/tmp.
     # It is configured before any subprocess can launch EgoAllo/JAX guidance.
     jax_compilation_cache_dir = configure_jax_compilation_cache(env, cfg, tmp_dir)
@@ -410,6 +457,8 @@ def main() -> None:
             "egoallo_outputs_dir": str(egoallo_outputs_dir),
             "ego_tmp_dir": str(ego_tmp_dir),
             "python_executable": sys.executable,
+            "python_pycache_dir": str(python_pycache_dir) if python_pycache_dir is not None else None,
+            "python_pycache_cleanup": python_pycache_cleanup,
             "jax_compilation_cache_dir": str(jax_compilation_cache_dir) if jax_compilation_cache_dir is not None else None,
             "inputs": {
                 "frames_dir": str(frames_dir),
@@ -472,7 +521,20 @@ def main() -> None:
         "--soft-end-frames", str(get_cfg(cfg, "hawor_extract.soft_end_frames", 6)),
         "--min-output-alpha", str(get_cfg(cfg, "hawor_extract.min_output_alpha", 0.0)),
         "--max-wrist-step-hand-ratio", str(get_cfg(cfg, "hawor_extract.max_wrist_step_hand_ratio", 2.0)),
+        "--min-track-len", str(get_cfg(cfg, "hawor_extract.min_track_len", 3)),
+        "--trim-segment-edges", str(get_cfg(cfg, "hawor_extract.trim_segment_edges", 0)),
+        "--max-gap-fill", str(get_cfg(cfg, "hawor_extract.max_gap_fill", 3)),
+        "--max-gap-endpoint-hand-ratio", str(get_cfg(cfg, "hawor_extract.max_gap_endpoint_hand_ratio", 1.5)),
+        "--smooth-window", str(get_cfg(cfg, "hawor_extract.smooth_window", 5)),
+        "--smooth-mode", str(get_cfg(cfg, "hawor_extract.smooth_mode", "translation")),
+        "--soft-start-anchor-max-gap", str(get_cfg(cfg, "hawor_extract.soft_start_anchor_max_gap", 45)),
     ]
+    add_flag(cmd, "--drop-isolated", get_cfg(cfg, "hawor_extract.drop_isolated", True))
+    if not bool(get_cfg(cfg, "hawor_extract.drop_isolated", True)):
+        cmd.append("--no-drop-isolated")
+    add_flag(cmd, "--soft-start-geometry", get_cfg(cfg, "hawor_extract.soft_start_geometry", True))
+    if not bool(get_cfg(cfg, "hawor_extract.soft_start_geometry", True)):
+        cmd.append("--no-soft-start-geometry")
     add_flag(cmd, "--print-jump-stats", get_cfg(cfg, "hawor_extract.print_jump_stats", True))
     run(cmd, env=env)
 
@@ -597,28 +659,49 @@ def main() -> None:
     run([
         py,
         str(SCRIPT_APPLY_ALIGNMENT),
-        "--pcd", str(scene_points_ply),
         "--poses", str(camera_poses_txt),
         "--R", str(R_align_npy),
         "--align_meta", str(alignment_transform_npz),
-        "--out_pcd", str(aligned_scene_ply),
         "--out_poses", str(head_trajectory_tmp),
-        "--output_voxel_size", str(get_cfg(cfg, "alignment.output_voxel_size", 0)),
+        "--poses-only",
     ], env=env)
 
     # Optional MoGe metric-scale estimation.
-    # This step only writes an estimate JSON under <output_dir>/tmp. It does not
-    # change any trajectory/point cloud directly. 05_apply_metric_scale.py later
-    # decides scale priority and may choose hands before MoGe.
+    # MoGe is expensive, so it is deferred until after a lightweight hands-only
+    # scale probe. If hands are selected successfully, MoGe is skipped.
     moge_scale_json: Path | None = None
     moge_output_dir: Path | None = None
     metric_scale_enabled = bool(get_cfg(cfg, "metric_scale.enabled", True))
     moge_enabled = metric_scale_enabled and bool(get_cfg(cfg, "metric_scale.moge.enabled", False))
+    moge_model_pt: Path | None = None
     if moge_enabled:
         require_file(SCRIPT_ESTIMATE_MOGE_SCALE, "04_estimate_moge_metric_scale.py")
         moge_output_dir = tmp_dir / str(get_cfg(cfg, "metric_scale.moge.output_dir_name", "moge_metric_scale"))
         moge_scale_json = moge_output_dir / "moge_scale_estimate.json"
         moge_model_pt = resolve_project_path(get_cfg(cfg, "model_weights.moge_model_pt", env.get("MOGE_MODEL_PT")))
+
+    def run_alignment_point_cloud_for_moge() -> Path:
+        moge_aligned_scene_ply = tmp_dir / "aligned_scene_for_moge.ply"
+        run([
+            py,
+            str(SCRIPT_APPLY_ALIGNMENT),
+            "--pcd", str(scene_points_ply),
+            "--poses", str(camera_poses_txt),
+            "--R", str(R_align_npy),
+            "--align_meta", str(alignment_transform_npz),
+            "--out_pcd", str(moge_aligned_scene_ply),
+            "--out_poses", str(tmp_dir / "head_trajectory_for_moge.npy"),
+            "--output_voxel_size", str(get_cfg(
+                cfg,
+                "metric_scale.moge.aligned_scene_voxel_size",
+                get_cfg(cfg, "metric_scale.final_scene_output_voxel_size", 0.01),
+            )),
+        ], env=env)
+        return moge_aligned_scene_ply
+
+    def run_moge_metric_scale_if_needed() -> None:
+        if not moge_enabled or moge_scale_json is None:
+            return
         if moge_model_pt is None:
             write_failed_scale_json(
                 moge_scale_json,
@@ -635,13 +718,14 @@ def main() -> None:
             )
             print(f"[MoGe] Skip MoGe scale: model.pt not found: {moge_model_pt}. Wrote {moge_scale_json}", flush=True)
         else:
+            moge_point_cloud_in = run_alignment_point_cloud_for_moge()
             moge_cmd = [
                 py,
                 str(SCRIPT_ESTIMATE_MOGE_SCALE),
                 "--frames-dir", str(frames_dir),
                 "--timestamps-txt", str(timestamps_txt),
                 "--head-trajectory-in", str(head_trajectory_tmp),
-                "--point-cloud-in", str(aligned_scene_ply),
+                "--point-cloud-in", str(moge_point_cloud_in),
                 "--intrinsics-path", str(intrinsics_txt),
                 "--moge-model-pt", str(moge_model_pt),
                 "--output-dir", str(moge_output_dir),
@@ -701,12 +785,20 @@ def main() -> None:
                 indent=2,
             )
 
+        scale_priority_csv = cfg_list_to_csv(
+            get_cfg(cfg, "metric_scale.scale_priority", None),
+            ["hands", "moge", "height", "none"],
+        )
         metric_scale_cmd = [
             py,
             str(SCRIPT_05_APPLY_SCALE),
             "--head-trajectory-in", str(head_trajectory_tmp),
-            "--point-cloud-in", str(aligned_scene_ply),
+            "--point-cloud-in", str(scene_points_ply),
             "--hamer-pkl-in", str(hamer_outputs_pkl_tmp),
+            "--point-cloud-space", "raw_vggt",
+            "--point-cloud-r-align", str(R_align_npy),
+            "--point-cloud-align-meta", str(alignment_transform_npz),
+            "--final-scene-output-voxel-size", str(get_cfg(cfg, "metric_scale.final_scene_output_voxel_size", 0.01)),
             "--head-trajectory-out", str(head_trajectory_out),
             "--point-cloud-out", str(final_scene_ply),
             "--hamer-pkl-out", str(hamer_outputs_pkl_out),
@@ -714,7 +806,7 @@ def main() -> None:
             "--floor-z", str(get_cfg(cfg, "metric_scale.floor_z", 0.0)),
             "--height-min", str(get_cfg(cfg, "metric_scale.height_min", 1.50)),
             "--height-max", str(get_cfg(cfg, "metric_scale.height_max", 1.60)),
-            "--scale-priority", cfg_list_to_csv(get_cfg(cfg, "metric_scale.scale_priority", None), ["hands", "moge", "height", "none"]),
+            "--scale-priority", scale_priority_csv,
             "--hand-scale-enabled", "1" if bool(get_cfg(cfg, "metric_scale.hand_fallback.enabled", True)) else "0",
             "--hand-scale-bones-json", str(hand_scale_bones_json),
             "--hand-scale-min-valid-bones", str(get_cfg(cfg, "metric_scale.hand_fallback.min_valid_bones", 20)),
@@ -746,8 +838,6 @@ def main() -> None:
             "--R-align-for-scale", str(R_align_npy),
             "--align-meta-for-scale", str(alignment_transform_npz),
         ]
-        if moge_scale_json is not None:
-            metric_scale_cmd.extend(["--moge-scale-json", str(moge_scale_json)])
 
         metric_target_height = get_cfg(cfg, "metric_scale.target_height", None)
         if metric_target_height is not None:
@@ -778,11 +868,54 @@ def main() -> None:
                 get_cfg(cfg, "metric_scale.frontend.include_mesh", False),
             )
 
+        priority_items = [x.strip().lower() for x in scale_priority_csv.split(",") if x.strip()]
+        hands_before_moge = (
+            "hands" in priority_items
+            and "moge" in priority_items
+            and priority_items.index("hands") < priority_items.index("moge")
+        )
+        run_moge_scale = bool(moge_enabled and "moge" in priority_items)
+        if run_moge_scale and hands_before_moge and bool(get_cfg(cfg, "metric_scale.hand_fallback.enabled", True)):
+            hand_probe_json = tmp_dir / "metric_scale_hand_probe.json"
+            hand_probe_cmd = list(metric_scale_cmd)
+            hand_probe_cmd[hand_probe_cmd.index("--metadata-out") + 1] = str(hand_probe_json)
+            hand_probe_cmd[hand_probe_cmd.index("--scale-priority") + 1] = "hands"
+            hand_probe_cmd.append("--probe-scale-only")
+            run(hand_probe_cmd, env=env)
+            try:
+                with hand_probe_json.open("r", encoding="utf-8") as f:
+                    hand_probe = json.load(f)
+                hand_probe_source = hand_probe.get("scale_source")
+            except Exception as exc:
+                hand_probe_source = None
+                print(f"[Warning] Failed to read hand scale probe metadata: {exc!r}. Fallback to MoGe.", flush=True)
+
+            if hand_probe_source == "hands":
+                run_moge_scale = False
+                print("[MoGe] Skip MoGe scale: hands scale probe succeeded.", flush=True)
+            else:
+                print(f"[MoGe] Hands scale probe did not select hands ({hand_probe_source}); run MoGe fallback.", flush=True)
+
+        if run_moge_scale:
+            run_moge_metric_scale_if_needed()
+            if moge_scale_json is not None:
+                metric_scale_cmd.extend(["--moge-scale-json", str(moge_scale_json)])
+
         run(metric_scale_cmd, env=env)
     else:
         shutil.copy2(head_trajectory_tmp, head_trajectory_out)
         shutil.copy2(hamer_outputs_pkl_tmp, hamer_outputs_pkl_out)
-        shutil.copy2(aligned_scene_ply, final_scene_ply)
+        run([
+            py,
+            str(SCRIPT_APPLY_ALIGNMENT),
+            "--pcd", str(scene_points_ply),
+            "--poses", str(camera_poses_txt),
+            "--R", str(R_align_npy),
+            "--align_meta", str(alignment_transform_npz),
+            "--out_pcd", str(final_scene_ply),
+            "--out_poses", str(tmp_dir / "head_trajectory_metric_disabled.npy"),
+            "--output_voxel_size", str(get_cfg(cfg, "metric_scale.final_scene_output_voxel_size", 0.01)),
+        ], env=env)
 
     # EgoAllo：不再使用 demo/sequence_name，直接使用 output_dir 下的目录。
     # 05_run_egoallo_from_head.py 的可选参数统一由 YAML 的 egoallo 段控制，
@@ -804,6 +937,10 @@ def main() -> None:
     env["EGOALLO_SAVE_ARGS"] = "1" if bool(get_cfg(cfg, "egoallo.save_args", True)) else "0"
     env["EGOALLO_EMPTY_CACHE_EACH_SEGMENT"] = "1" if bool(get_cfg(cfg, "egoallo.empty_cache_each_segment", False)) else "0"
     env["EGOALLO_ALLOW_TF32"] = "1" if bool(get_cfg(cfg, "egoallo.allow_tf32", False)) else "0"
+    env["EGOALLO_PARALLEL_WORKERS"] = str(get_cfg(cfg, "egoallo.parallel_workers", 1))
+    env["EGOALLO_AVAILABLE_VRAM_GB"] = str(get_cfg(cfg, "egoallo.available_vram_gb", 0))
+    env["EGOALLO_ESTIMATED_MODEL_VRAM_GB"] = str(get_cfg(cfg, "egoallo.estimated_model_vram_gb", 6.0))
+    env["EGOALLO_ESTIMATED_VRAM_GB_PER_FRAME"] = str(get_cfg(cfg, "egoallo.estimated_vram_gb_per_frame", 0.020))
 
     env["EGOALLO_EXPECTED_HEAD_HEIGHT_MIN"] = str(get_cfg(cfg, "egoallo.expected_head_height_min", 1.0))
     env["EGOALLO_EXPECTED_HEAD_HEIGHT_MAX"] = str(get_cfg(cfg, "egoallo.expected_head_height_max", 2.2))
@@ -814,7 +951,7 @@ def main() -> None:
     else:
         env.pop("EGOALLO_END_INDEX", None)
 
-    segment_length = str(get_cfg(cfg, "egoallo.target_segment_length", get_cfg(cfg, "egoallo.segment_length", 256)))
+    segment_length = str(get_cfg(cfg, "egoallo.target_segment_length", 256))
     # EgoAllo 分段输出目录：只保存每段中心裁剪后的 .npz / _args.yaml，不和最终结果目录混在一起。
     # 05_run_egoallo_from_head.py 会按照 EGOALLO_CONTEXT_FRAMES 做重叠推理 + 中间裁剪。
     # 06_smooth_egoallo_segments.py 现在作为 merge-only 脚本，从 ego_tmp_dir 读取分段文件，
@@ -827,8 +964,8 @@ def main() -> None:
         segment_length,
     ], env=env)
 
-    # Merge：从 output_dir/ego_tmp 读取 EgoAllo 分段 .npz，输出到 output_dir/egoallo_outputs。
-    # 这里不再默认做平滑；重叠推理 + 中间裁剪后，06 脚本只负责合并和质量报告。
+    # Merge/smooth：从 output_dir/ego_tmp 读取 EgoAllo 分段 .npz，输出到 output_dir/egoallo_outputs。
+    # 06 脚本负责分段接缝 blend 和可选的全局轻量时序平滑。
     motion_quality_report_json = tmp_dir / str(get_cfg(cfg, "smooth.report_json_name", "motion_quality_report.json"))
     if bool(get_cfg(cfg, "smooth.enabled", True)):
         smooth_cmd = [
@@ -862,6 +999,10 @@ def main() -> None:
         "egoallo_inputs_dir": str(egoallo_inputs_dir),
         "egoallo_outputs_dir": str(egoallo_outputs_dir),
         "ego_tmp_dir": str(ego_tmp_dir),
+        "python_cache": {
+            "pycache_prefix": env.get("PYTHONPYCACHEPREFIX"),
+            "cleanup_existing_scripts_pycache": python_pycache_cleanup,
+        },
         "model_sources": {
             "egoallo_root_fallback": env.get("EGOALLO_ROOT"),
             "geocalib_root_fallback": env.get("GEOCALIB_ROOT"),

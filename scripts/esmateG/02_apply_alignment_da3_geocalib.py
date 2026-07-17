@@ -457,7 +457,7 @@ def main():
         )
     )
 
-    parser.add_argument("--pcd", required=True, help="Input DA3 point cloud, e.g. combined_pcd.ply")
+    parser.add_argument("--pcd", default=None, help="Input DA3 point cloud, e.g. combined_pcd.ply")
     parser.add_argument("--poses", required=True, help="Input DA3 c2w camera poses, e.g. camera_poses.txt")
     parser.add_argument("--R", required=True, help="Input Y-up gravity rotation matrix, e.g. R_align.npy")
     parser.add_argument(
@@ -466,7 +466,7 @@ def main():
         help="Optional alignment metadata .npz from 01_estimate_gravity_da3.py",
     )
 
-    parser.add_argument("--out_pcd", default="egoallo_zup_scene_floor0.ply", help="Output EgoAllo Z-up floor-z0 point cloud")
+    parser.add_argument("--out_pcd", default=None, help="Output EgoAllo Z-up floor-z0 point cloud")
     parser.add_argument("--out_poses", default="egoallo_zup_poses_floor0.npy", help="Output EgoAllo Z-up floor-z0 c2w poses")
     parser.add_argument("--out_R_final", default=None, help="Optional path to save final rotation matrix")
     parser.add_argument(
@@ -475,13 +475,13 @@ def main():
         default=0.01,
         help="Voxel size for final point-cloud downsampling; use 0 to disable.",
     )
+    parser.add_argument(
+        "--poses-only",
+        action="store_true",
+        help="Only transform and save poses. Requires --align_meta and skips all point-cloud IO.",
+    )
 
     args = parser.parse_args()
-
-    # Load point cloud.
-    pcd = o3d.io.read_point_cloud(args.pcd)
-    if pcd.is_empty():
-        raise RuntimeError(f"Empty point cloud: {args.pcd}")
 
     # Load c2w poses.
     Ts = load_da3_poses_c2w(args.poses)
@@ -501,18 +501,37 @@ def main():
     if not np.isclose(det_R, 1.0, atol=1e-3):
         print(f"[Warning] det(R_final) = {det_R:.6f}, expected close to 1.0")
 
-    # Debug before alignment.
-    P_raw = np.asarray(pcd.points, dtype=np.float64)
-    print_xyz_ranges(P_raw, "raw point cloud")
+    if args.poses_only and args.align_meta is None:
+        raise ValueError("--poses-only requires --align_meta so floor translation can be reused without point-cloud IO")
+
+    if not args.poses_only:
+        if args.pcd is None:
+            raise ValueError("--pcd is required unless --poses-only is set")
+        if args.out_pcd is None:
+            raise ValueError("--out_pcd is required unless --poses-only is set")
+        pcd = o3d.io.read_point_cloud(args.pcd)
+        if pcd.is_empty():
+            raise RuntimeError(f"Empty point cloud: {args.pcd}")
+
+        # Debug before alignment.
+        P_raw = np.asarray(pcd.points, dtype=np.float64)
+        print_xyz_ranges(P_raw, "raw point cloud")
+    else:
+        pcd = None
+
     print_pose_ranges(Ts, "raw poses")
 
     # Step 1: apply final rotation.
-    pcd_rot = apply_rotation_to_point_cloud(pcd, R_final)
     Ts_rot = apply_rotation_to_poses_c2w(Ts, R_final)
 
-    # Debug after rotation, before floor translation.
-    P_rot = np.asarray(pcd_rot.points, dtype=np.float64)
-    print_xyz_ranges(P_rot, "EgoAllo Z-up point cloud before floor translation")
+    if pcd is not None:
+        pcd_rot = apply_rotation_to_point_cloud(pcd, R_final)
+        # Debug after rotation, before floor translation.
+        P_rot = np.asarray(pcd_rot.points, dtype=np.float64)
+        print_xyz_ranges(P_rot, "EgoAllo Z-up point cloud before floor translation")
+    else:
+        pcd_rot = None
+
     print_pose_ranges(Ts_rot, "EgoAllo Z-up poses before floor translation")
 
     # Step 2: estimate current floor height and translate it to z=0.
@@ -521,8 +540,10 @@ def main():
             args.align_meta,
             R_final,
         )
-    else:
+    elif pcd_rot is not None:
         floor_z, floor_method = estimate_floor_z_auto(pcd_rot)
+    else:
+        raise ValueError("Cannot estimate floor without --align_meta or --pcd")
 
     t_floor = np.array([0.0, 0.0, -floor_z], dtype=np.float64)
 
@@ -531,17 +552,22 @@ def main():
     print(f"  estimated floor_z before translation: {floor_z:.6f}")
     print(f"  apply translation to both point cloud and camera centers: {t_floor.tolist()}")
 
-    pcd_out = apply_translation_to_point_cloud(pcd_rot, t_floor)
     Ts_out = apply_translation_to_poses_c2w(Ts_rot, t_floor)
 
-    # Debug after alignment and floor translation.
-    P_aligned = np.asarray(pcd_out.points, dtype=np.float64)
-    print_xyz_ranges(P_aligned, "EgoAllo Z-up point cloud after floor translation")
+    if pcd_rot is not None:
+        pcd_out = apply_translation_to_point_cloud(pcd_rot, t_floor)
+
+        # Debug after alignment and floor translation.
+        P_aligned = np.asarray(pcd_out.points, dtype=np.float64)
+        print_xyz_ranges(P_aligned, "EgoAllo Z-up point cloud after floor translation")
+    else:
+        pcd_out = None
+
     print_pose_ranges(Ts_out, "EgoAllo Z-up poses after floor translation")
 
-    if args.output_voxel_size < 0:
+    if pcd_out is not None and args.output_voxel_size < 0:
         raise ValueError("--output_voxel_size must be >= 0")
-    if args.output_voxel_size > 0:
+    if pcd_out is not None and args.output_voxel_size > 0:
         points_before = len(pcd_out.points)
         pcd_out = pcd_out.voxel_down_sample(args.output_voxel_size)
         print(
@@ -551,14 +577,16 @@ def main():
         )
 
     # Save.
-    o3d.io.write_point_cloud(args.out_pcd, pcd_out)
+    if pcd_out is not None:
+        o3d.io.write_point_cloud(args.out_pcd, pcd_out)
     np.save(args.out_poses, Ts_out)
 
     if args.out_R_final is not None:
         np.save(args.out_R_final, R_final)
         print("Saved final rotation:", args.out_R_final)
 
-    print("\nSaved point cloud:", args.out_pcd)
+    if pcd_out is not None:
+        print("\nSaved point cloud:", args.out_pcd)
     print("Saved poses:", args.out_poses)
     print("\nDone.")
     print("This script applied:")

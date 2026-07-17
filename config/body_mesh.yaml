@@ -102,9 +102,25 @@ config: &body_mesh_config
       ego_tmp: false
 
   hawor_extract:
-    soft_start_frames: 20
+    # 这些参数决定“上游检测到的手”有多少会真正进入 EgoAllo 的 hamer_outputs.pkl。
+    # 如果怀疑手部约束太少，可以临时改成：
+    #   drop_isolated: false
+    #   min_track_len: 1
+    #   soft_start_frames: 1
+    #   soft_end_frames: 1
+    # 这样会尽量保留检测帧并给满权重，但更容易把抖动/误检也作为强约束。
+    soft_start_frames: 15
     soft_end_frames: 10
     min_output_alpha: 0.0
+    drop_isolated: true
+    min_track_len: 3
+    trim_segment_edges: 0
+    max_gap_fill: 3
+    max_gap_endpoint_hand_ratio: 1.5
+    smooth_window: 5
+    smooth_mode: translation
+    soft_start_geometry: true
+    soft_start_anchor_max_gap: 45
     max_wrist_step_hand_ratio: 1.5
     print_jump_stats: true
 
@@ -134,7 +150,7 @@ config: &body_mesh_config
 
     viz_enabled: true
     viz_dir_name: geocalib_viz
-    viz_save_all_sampled: true
+    viz_save_all_sampled: false
     viz_save_selected: false
 
   alignment:
@@ -148,11 +164,14 @@ config: &body_mesh_config
     min_valid_camera_height_margin_factor: 2.0
     min_camera_above_floor_ratio: 0.95
     min_camera_p10_height_margin_factor: -2.0
-    output_voxel_size: 0.01
 
   metric_scale:
     enabled: true
     floor_z: 0.0
+
+    # 最终写出 final_scene.ply 时做一次降采样。0 表示不降采样。
+    # 02_apply_alignment_da3_geocalib.py 现在默认只输出 head_trajectory.npy，不再写中间 aligned_scene.ply。
+    final_scene_output_voxel_size: 0.003
 
     # 尺度估计优先级：
     # 1. 手骨架
@@ -191,7 +210,7 @@ config: &body_mesh_config
       output_dir_name: moge_metric_scale
 
       # 先均匀抽 48 帧作为候选，只做 CPU 轻量质量检查
-      candidate_samples: 60
+      candidate_samples: 48
 
       # 从候选帧中选质量最好的 24 帧真正跑 MoGe
       # 想快可以 16，想稳可以 32
@@ -237,8 +256,8 @@ config: &body_mesh_config
       resolution_level: 9
       use_intrinsics_fov: true
 
-      save_depth_maps: true
-      save_projection_matches: true
+      save_depth_maps: false
+      save_projection_matches: false
       save_sampled_frames: false
 
       # CPU 轻量图像质量检查阈值
@@ -315,14 +334,17 @@ config: &body_mesh_config
       hands_jsonl_name: hand_keypoints_egoallo.jsonl
 
   egoallo:
-    # 每段最终保存多少帧
-    target_segment_length: 512
+    # EgoAllo 分段推理参数：
+    # - target_segment_length 是每段最终保存的帧数。
+    # - context_frames 是每段推理时额外读取的前后输入帧，只提供 head/hands/timestamps 上下文。
+    # - save_only_center=true 时，只保存 target 中心段，context 部分会被裁掉。
+    # 例：target_segment_length=512, context_frames=30 时，
+    #   第 2 段 target=512-1024，实际 infer=482-1054，最后只保存 512-1024。
+    # 并行模式下，每段是独立 Python 进程；context_frames 不会读取上一段生成的人体 pose。
+    target_segment_length: 256
 
-    # 兼容旧字段，建议和 target_segment_length 保持一致
-    segment_length: 512
-
-    # 每段推理时额外看前后多少帧
-    context_frames: 30
+    # 每段推理时额外看前后多少帧。数值越大，边界上下文越多，但显存估算也越高。
+    context_frames: 20
 
     # 只保存中间目标段，不保存上下文重叠部分
     save_only_center: true
@@ -343,16 +365,36 @@ config: &body_mesh_config
     empty_cache_each_segment: false
     allow_tf32: false
 
+    # EgoAllo 多进程分片并行：
+    # - parallel_workers=1：原来的串行模式，一个进程按段依次跑。
+    # - parallel_workers>1：每个 segment 单独启动一个 Python worker 进程。
+    # - available_vram_gb>0 时启用显存预算调度；只有预计并发显存 <= available_vram_gb 才会启动新段。
+    # - 如果 parallel_workers 设置很大，但显存预算不够，只会启动预算允许的 worker 数。
+    # - 如果单个 segment 预计显存已经超过 available_vram_gb，会直接报错，需减小 segment/context 或提高预算。
+    # 估算公式：
+    #   estimated_model_vram_gb + estimated_vram_gb_per_frame * infer_length
+    # 其中 infer_length 约等于 target_segment_length + 2 * context_frames，中间/末尾段会按边界裁剪。
+    parallel_workers: 2
+    available_vram_gb: 12
+    estimated_model_vram_gb: 6.0
+    estimated_vram_gb_per_frame: 0.020
+
     expected_head_height_min: 1.0
     expected_head_height_max: 2.2
 
   smooth:
     enabled: true
 
-    # 不再主动平滑，避免掩盖手腕/脚接触/穿地问题
-    boundary_blend_frames: 15
-    translation_smooth_window: 7
-    quat_lowpass_alpha: 0.15
+    # 只在 EgoAllo 分段接缝前后做局部 blend，缓解分段独立采样导致的人体跳变。
+    # 数值越大，边界越平滑，但越可能抹掉接缝附近的真实动作。36,15,0.2
+    boundary_blend_frames: 36
+
+    # root translation 滑窗平滑。0/1 表示关闭；偶数会自动提升为下一个奇数。
+    translation_smooth_window: 15
+
+    # 旋转低通平滑。0 表示关闭。
+    # 建议先试 0.15；如果仍抖，试 0.20~0.30。
+    quat_lowpass_alpha: 0.20
 
     print_stats: true
     strict_frame_continuity: false
@@ -367,6 +409,11 @@ config: &body_mesh_config
       enable_xla_caches: xla_gpu_per_fusion_autotune_cache_dir
       explain_cache_misses: false
       debug_log_modules: false
+
+  python_cache:
+    redirect_pycache_to_tmp: true
+    pycache_subdir: pycache
+    cleanup_existing_scripts_pycache: true
 
 # Also expose the algorithm config at the YAML top level for local runs:
 #   python scripts/run_body_mesh.py --config config/body_mesh.yaml ...

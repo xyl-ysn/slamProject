@@ -396,6 +396,81 @@ def try_scale_ply_with_plyfile(input_path: Path, output_path: Path, scale: float
     }
 
 
+def transform_and_scale_point_cloud(
+    input_path: Path,
+    output_path: Path,
+    *,
+    scale: float,
+    floor_z: float,
+    input_space: str,
+    r_align_path: Path | None,
+    align_meta_path: Path | None,
+    output_voxel_size: float,
+) -> dict:
+    input_space = str(input_space or "egoallo").strip().lower()
+    if input_space not in {"egoallo", "raw_vggt"}:
+        raise ValueError(f"Unsupported --point-cloud-space: {input_space}")
+
+    if input_space == "egoallo" and float(output_voxel_size) <= 0:
+        return try_scale_ply_with_plyfile(input_path, output_path, scale, floor_z)
+
+    try:
+        import open3d as o3d
+    except Exception as exc:
+        if input_space == "egoallo":
+            return try_scale_ply_with_plyfile(input_path, output_path, scale, floor_z)
+        raise RuntimeError("open3d is required for --point-cloud-space raw_vggt") from exc
+
+    pcd = o3d.io.read_point_cloud(str(input_path))
+    if pcd.is_empty():
+        raise RuntimeError(f"Empty point cloud: {input_path}")
+
+    points_before = int(len(pcd.points))
+    points = np.asarray(pcd.points, dtype=np.float64)
+    normals = np.asarray(pcd.normals, dtype=np.float64) if pcd.has_normals() else None
+
+    R_final = None
+    t_floor = None
+    if input_space == "raw_vggt":
+        if r_align_path is None or align_meta_path is None:
+            raise ValueError("--point-cloud-space raw_vggt requires --point-cloud-r-align and --point-cloud-align-meta")
+        R_final, t_floor = load_vggt_to_egoallo_transform(r_align_path, align_meta_path)
+        points = transform_vggt_world_to_egoallo(points, R_final, t_floor)
+        if normals is not None:
+            normals = (R_final @ normals.T).T
+
+    points = scale_world_points(points, scale, floor_z)
+
+    pcd_out = o3d.geometry.PointCloud()
+    pcd_out.points = o3d.utility.Vector3dVector(points)
+    if pcd.has_colors():
+        pcd_out.colors = pcd.colors
+    if normals is not None:
+        pcd_out.normals = o3d.utility.Vector3dVector(normals)
+
+    if float(output_voxel_size) < 0:
+        raise ValueError("--final-scene-output-voxel-size must be >= 0")
+    if float(output_voxel_size) > 0:
+        pcd_out = pcd_out.voxel_down_sample(float(output_voxel_size))
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    o3d.io.write_point_cloud(str(output_path), pcd_out)
+
+    out_points = np.asarray(pcd_out.points, dtype=np.float64)
+    return {
+        "input": str(input_path),
+        "output": str(output_path),
+        "input_space": input_space,
+        "vertex_count_before": points_before,
+        "vertex_count": int(len(out_points)),
+        "output_voxel_size": float(output_voxel_size),
+        "R_final": None if R_final is None else R_final.tolist(),
+        "t_floor": None if t_floor is None else t_floor.tolist(),
+        "min": out_points.min(axis=0).tolist() if len(out_points) else None,
+        "max": out_points.max(axis=0).tolist() if len(out_points) else None,
+    }
+
+
 def scale_value_for_json(key: str, value, scale: float, floor_z: float):
     if key in WORLD_FIELDS:
         arr = np.asarray(value, dtype=np.float64)
@@ -1425,6 +1500,20 @@ def main() -> None:
     parser.add_argument("--head-trajectory-in", required=True, type=Path)
     parser.add_argument("--point-cloud-in", required=True, type=Path)
     parser.add_argument("--hamer-pkl-in", required=True, type=Path)
+    parser.add_argument(
+        "--point-cloud-space",
+        choices=("egoallo", "raw_vggt"),
+        default="egoallo",
+        help="Coordinate space of --point-cloud-in. raw_vggt is aligned inside this script before final output.",
+    )
+    parser.add_argument("--point-cloud-r-align", type=Path, default=None)
+    parser.add_argument("--point-cloud-align-meta", type=Path, default=None)
+    parser.add_argument(
+        "--final-scene-output-voxel-size",
+        type=float,
+        default=0.0,
+        help="Voxel size for final_scene.ply downsampling; 0 disables downsampling.",
+    )
 
     # Required pipeline outputs.
     parser.add_argument("--head-trajectory-out", required=True, type=Path)
@@ -1540,6 +1629,11 @@ def main() -> None:
         action="store_true",
         help="Also export scaled mesh_vertices_3d in hand_keypoints_egoallo.jsonl. This can be very large.",
     )
+    parser.add_argument(
+        "--probe-scale-only",
+        action="store_true",
+        help="Only decide metric scale and write metadata; do not write scaled outputs.",
+    )
     parser.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args()
@@ -1560,6 +1654,10 @@ def main() -> None:
             "hands_vggt_jsonl_in": str(args.hands_vggt_jsonl_in) if args.hands_vggt_jsonl_in is not None else None,
             "R_align": str(args.r_align) if args.r_align is not None else None,
             "align_meta": str(args.align_meta) if args.align_meta is not None else None,
+            "point_cloud_space": str(args.point_cloud_space),
+            "point_cloud_r_align": str(args.point_cloud_r_align) if args.point_cloud_r_align is not None else None,
+            "point_cloud_align_meta": str(args.point_cloud_align_meta) if args.point_cloud_align_meta is not None else None,
+            "final_scene_output_voxel_size": float(args.final_scene_output_voxel_size),
             "scale_priority": str(args.scale_priority),
             "moge_scale_json": str(args.moge_scale_json) if args.moge_scale_json is not None else None,
             "hand_scale_bones_json": str(args.hand_scale_bones_json) if args.hand_scale_bones_json is not None else None,
@@ -1597,6 +1695,15 @@ def main() -> None:
     if scaled_p90 is not None:
         print(f"scaled p90 head height: {float(scaled_p90):.6f}")
 
+    if args.probe_scale_only:
+        metadata["outputs"]["probe_scale_only"] = True
+        args.metadata_out.parent.mkdir(parents=True, exist_ok=True)
+        metadata_json = _coerce_json_friendly(metadata)
+        with args.metadata_out.open("w", encoding="utf-8") as f:
+            json.dump(metadata_json, f, ensure_ascii=False, indent=2)
+        print(f"Probe scale only; wrote metadata: {args.metadata_out}")
+        return
+
     if args.dry_run:
         print("Dry run enabled; no files written.")
         return
@@ -1609,11 +1716,15 @@ def main() -> None:
     )
     print(f"Saved scaled head trajectory: {args.head_trajectory_out}")
 
-    metadata["outputs"]["point_cloud"] = try_scale_ply_with_plyfile(
+    metadata["outputs"]["point_cloud"] = transform_and_scale_point_cloud(
         args.point_cloud_in,
         args.point_cloud_out,
-        scale,
-        args.floor_z,
+        scale=scale,
+        floor_z=args.floor_z,
+        input_space=args.point_cloud_space,
+        r_align_path=args.point_cloud_r_align,
+        align_meta_path=args.point_cloud_align_meta,
+        output_voxel_size=args.final_scene_output_voxel_size,
     )
     print(f"Saved scaled point cloud: {args.point_cloud_out}")
 
