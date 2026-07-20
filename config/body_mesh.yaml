@@ -22,7 +22,7 @@ args: []
 
 modelData:
   # Local project checkout on this machine.
-  hostPath: /home/xieyongling/slam_project/ego-pose-project
+  hostPath: /home/opsuser/thk/ego-pose-project
   hostPathType: Directory
   readOnly: true
   external:
@@ -68,24 +68,24 @@ config: &body_mesh_config
     device: cuda
 
   model_sources:
-    egoallo_root: third_party/egoallo
-    geocalib_root: third_party/GeoCalib
+    egoallo_root: /home/opsuser/thk/external/human_pose_tool/egoallo
+    geocalib_root: /home/opsuser/thk/external/human_pose_tool/GeoCalib
     moge_root: third_party/MoGe
 
   model_weights:
-    egoallo_checkpoint_dir: third_party/egoallo/egoallo_checkpoint_april13
-    egoallo_model_config_path: third_party/egoallo/egoallo_checkpoint_april13/model_config.yaml
-    egoallo_model_npz: third_party/egoallo/data/smplh/neutral/model.npz
+    egoallo_checkpoint_dir: /home/opsuser/thk/weights/human_pose_tool/egoallo/egoallo_checkpoint_april13
+    egoallo_model_config_path: /home/opsuser/thk/weights/human_pose_tool/egoallo/egoallo_checkpoint_april13/model_config.yaml
+    egoallo_model_npz: /home/opsuser/thk/weights/human_pose_tool/egoallo/model.npz
 
-    geocalib_pinhole_tar: /home/xieyongling/.cache/torch/hub/geocalib/pinhole.tar
+    geocalib_pinhole_tar: /home/opsuser/thk/weights/human_pose_tool/geocalib/pinhole.tar
 
-    mano_left_pkl: model/MANO_LEFT.pkl
-    mano_right_pkl: model/MANO_RIGHT.pkl
+    mano_left_pkl: /home/opsuser/thk/weights/human_pose_tool/hand_mano/MANO_LEFT.pkl
+    mano_right_pkl: /home/opsuser/thk/weights/human_pose_tool/hand_mano/MANO_RIGHT.pkl
 
-    smplh_npz_path: third_party/egoallo/data/smplh/neutral/model.npz
+    smplh_npz_path: /home/opsuser/thk/weights/human_pose_tool/egoallo/model.npz
     # 本机当前没有找到 MoGe model.pt；留空时 run_body_mesh.py 会跳过 MoGe，
     # 继续使用 hands / height fallback 做 metric scale。
-    moge_model_pt: third_party/MoGe/weight/model.pt
+    moge_model_pt: /home/opsuser/thk/weights/human_pose_tool/moge/model.pt
 
   output_layout:
     tmp_dir_name: tmp
@@ -341,7 +341,7 @@ config: &body_mesh_config
     # 例：target_segment_length=512, context_frames=30 时，
     #   第 2 段 target=512-1024，实际 infer=482-1054，最后只保存 512-1024。
     # 并行模式下，每段是独立 Python 进程；context_frames 不会读取上一段生成的人体 pose。
-    target_segment_length: 256
+    target_segment_length: 512
 
     # 每段推理时额外看前后多少帧。数值越大，边界上下文越多，但显存估算也越高。
     context_frames: 20
@@ -374,8 +374,8 @@ config: &body_mesh_config
     # 估算公式：
     #   estimated_model_vram_gb + estimated_vram_gb_per_frame * infer_length
     # 其中 infer_length 约等于 target_segment_length + 2 * context_frames，中间/末尾段会按边界裁剪。
-    parallel_workers: 2
-    available_vram_gb: 12
+    parallel_workers: 1
+    available_vram_gb: 0
     estimated_model_vram_gb: 6.0
     estimated_vram_gb_per_frame: 0.020
 

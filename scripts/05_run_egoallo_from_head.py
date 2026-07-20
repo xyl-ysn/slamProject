@@ -540,40 +540,116 @@ def run_parallel_coordinator(args: Args) -> None:
         return
 
     num_workers = min(max_workers, len(tasks))
-    task_groups: list[list[SegmentTask]] = [[] for _ in range(num_workers)]
-    for i, task in enumerate(tasks):
-        task_groups[i % num_workers].append(task)
-    task_groups = [g for g in task_groups if g]
 
-    pending = []
-    for worker_idx, group in enumerate(task_groups):
-        est = estimate_worker_vram_gb(args, group)
-        if budget > 0 and est > budget:
-            raise RuntimeError(
-                f"Worker {worker_idx} estimated VRAM {est:.3f} GB exceeds "
-                f"available_vram_gb={budget:.3f} for task batch."
-            )
-        worker_task_file = _write_worker_task_file(
-            Path(args.output_dir) if args.output_dir is not None else args.traj_root / "ego_tmp",
-            worker_idx,
-            group,
-        )
-        target_summary = f"{group[0].target_start}-{group[-1].target_end}"
-        infer_summary = f"{group[0].infer_start}-{group[-1].infer_end}"
-        pending.append({
-            "worker_id": int(worker_idx),
-            "tasks": group,
-            "task_file": worker_task_file,
-            "worker_vram": float(est),
-            "summary": f"segment={group[0].segment_index}-{group[-1].segment_index}, target={target_summary}, infer={infer_summary}",
-        })
+    pending_queue = list(tasks)
 
     running: list[dict[str, object]] = []
     completed = 0
-    temp_files: set[Path] = {item["task_file"] for item in pending}
+    temp_files: set[Path] = set()
+    next_worker_id = 0
+    last_defer_signature = ""
+    last_defer_log_ts = 0.0
 
-    while pending or running:
+    def _maybe_log_deferral(
+        reason: str,
+        task: SegmentTask,
+        used_vram: float,
+        est_vram: float,
+        budget_gb: float,
+    ) -> None:
+        nonlocal last_defer_signature, last_defer_log_ts
+        signature = f"{reason}:{task.target_start}-{task.target_end}|{task.infer_start}-{task.infer_end}|u={used_vram:.3f}|e={est_vram:.3f}|b={budget_gb:.3f}"
+        now = time.time()
+        if signature == last_defer_signature and now - last_defer_log_ts < 5.0:
+            return
+        print(
+            f"[EgoAllo parallel] deferring launch ({reason}): "
+            f"target={task.target_start}-{task.target_end}, infer={task.infer_start}-{task.infer_end}, "
+            f"estimated_vram={est_vram:.3f}GB, used_vram={used_vram:.3f}GB, budget={budget_gb:.3f}GB",
+            flush=True,
+        )
+        last_defer_signature = signature
+        last_defer_log_ts = now
+
+    def _clear_deferral_state() -> None:
+        nonlocal last_defer_signature
+        last_defer_signature = ""
+
+    def pop_next_task() -> list[SegmentTask] | None:
+        if not pending_queue:
+            return None
+        task = pending_queue.pop(0)
+        return [task]
+
+    def push_back_task(task_group: list[SegmentTask]) -> None:
+        # restore popped tasks when launch is blocked by VRAM budget
+        if task_group:
+            pending_queue.insert(0, task_group[0])
+
+    def start_worker(worker_id: int, task_group: list[SegmentTask], used_vram: float) -> tuple[dict[str, object], float]:
+        est = estimate_worker_vram_gb(args, task_group)
+        if budget > 0 and est > budget:
+            raise RuntimeError(
+                f"Worker {worker_id} estimated VRAM {est:.3f} GB exceeds "
+                f"available_vram_gb={budget:.3f} for a task."
+            )
+        if budget > 0 and used_vram + est > budget:
+            raise RuntimeError(
+                f"Worker {worker_id} estimated VRAM {est:.3f} GB cannot be launched: "
+                f"used_after={used_vram + est:.3f}GB > available_vram_gb={budget:.3f}."
+            )
+
+        target_summary = f"{task_group[0].target_start}-{task_group[-1].target_end}"
+        infer_summary = f"{task_group[0].infer_start}-{task_group[-1].infer_end}"
+        task_file = _write_worker_task_file(
+            Path(args.output_dir) if args.output_dir is not None else args.traj_root / "ego_tmp",
+            worker_id,
+            task_group,
+        )
+        temp_files.add(task_file)
+        cmd = build_worker_command(args, task_group, task_file)
+
+        print(
+            f"[EgoAllo parallel] launch worker {worker_id}: "
+            f"segment={task_group[0].segment_index}-{task_group[-1].segment_index}, "
+            f"target={target_summary}, infer={infer_summary} "
+            f"estimated_vram={est:.3f}GB used_after={used_vram + est:.3f}GB",
+            flush=True,
+        )
+        proc = subprocess.Popen(cmd, env=os.environ.copy())
+        return (
+            {
+                "proc": proc,
+                "worker_id": worker_id,
+                "tasks": task_group,
+                "worker_vram": est,
+                "summary": f"segment={task_group[0].segment_index}-{task_group[-1].segment_index}, target={target_summary}, infer={infer_summary}",
+                "task_file": task_file,
+                "cmd": cmd,
+            },
+            est,
+        )
+
+    # 首批启动 worker
+    used_vram = 0.0
+    for _ in range(num_workers):
+        next_tasks = pop_next_task()
+        if next_tasks is None:
+            break
+        next_vram = estimate_worker_vram_gb(args, next_tasks)
+        if budget > 0 and used_vram + next_vram > budget:
+            push_back_task(next_tasks)
+            _maybe_log_deferral("initial window", next_tasks[0], used_vram, next_vram, budget)
+            break
+        worker_item, worker_vram = start_worker(next_worker_id, next_tasks, used_vram)
+        next_worker_id += 1
+        _clear_deferral_state()
+        running.append(worker_item)
+        used_vram += worker_vram
+
+    while pending_queue or running:
         still_running = []
+        free_worker_ids: list[int] = []
         for item in running:
             proc = item["proc"]
             assert isinstance(proc, subprocess.Popen)
@@ -583,6 +659,7 @@ def run_parallel_coordinator(args: Args) -> None:
                 continue
             if code != 0:
                 raise subprocess.CalledProcessError(code, item["cmd"])
+            used_vram -= float(item["worker_vram"])
             task_count = len(item["tasks"]) if isinstance(item["tasks"], list) else 0
             completed += task_count
             summary = item["summary"] if isinstance(item["summary"], str) else ""
@@ -591,43 +668,49 @@ def run_parallel_coordinator(args: Args) -> None:
                 f"{summary}",
                 flush=True,
             )
+            _clear_deferral_state()
+            free_worker_ids.append(int(item["worker_id"]))
         running = still_running
-
-        used_vram = sum(float(item["worker_vram"]) for item in running)
         launched = False
-        while pending and len(running) < max_workers:
-            item = pending[0]
-            est = float(item["worker_vram"])
-            if budget > 0 and used_vram + est > budget:
+        blocked_due_budget = False
+        # 优先回填刚完成 worker 的 worker_id，保持日志可读性
+        while free_worker_ids:
+            next_tasks = pop_next_task()
+            if next_tasks is None:
                 break
-            pending.pop(0)
-            task_file = item["task_file"]
-            assert isinstance(task_file, Path)
-            cmd = build_worker_command(args, item["tasks"], task_file)
-            print(
-                f"[EgoAllo parallel] launch worker {item['worker_id']}: "
-                f"{item['summary']} "
-                f"estimated_vram={est:.3f}GB used_after={used_vram + est:.3f}GB",
-                flush=True,
-            )
-            proc = subprocess.Popen(cmd, env=os.environ.copy())
-            running.append(
-                {
-                    "proc": proc,
-                    "worker_id": item["worker_id"],
-                    "tasks": item["tasks"],
-                    "worker_vram": item["worker_vram"],
-                    "summary": item["summary"],
-                    "task_file": item["task_file"],
-                    "cmd": cmd,
-                }
-            )
-            used_vram += est
+            worker_id = free_worker_ids.pop(0)
+            est = estimate_worker_vram_gb(args, next_tasks)
+            if budget > 0 and used_vram + est > budget:
+                push_back_task(next_tasks)
+                _maybe_log_deferral("no free budget", next_tasks[0], used_vram, est, budget)
+                blocked_due_budget = True
+                break
+            worker_item, worker_vram = start_worker(worker_id, next_tasks, used_vram)
+            running.append(worker_item)
+            _clear_deferral_state()
+            used_vram += worker_vram
+            launched = True
+
+        while len(running) < max_workers and pending_queue and not blocked_due_budget:
+            next_tasks = pop_next_task()
+            if next_tasks is None:
+                break
+            est = estimate_worker_vram_gb(args, next_tasks)
+            if budget > 0 and used_vram + est > budget:
+                push_back_task(next_tasks)
+                _maybe_log_deferral("parallel budget cap", next_tasks[0], used_vram, est, budget)
+                break
+            worker_item, worker_vram = start_worker(next_worker_id, next_tasks, used_vram)
+            running.append(worker_item)
+            _clear_deferral_state()
+            next_worker_id += 1
+            used_vram += worker_vram
             launched = True
 
         if not launched and running:
             time.sleep(1.0)
-        elif pending and not running:
+        elif not running and pending_queue:
+            # 任务队列里还有任务但当前显存预算无法放下任何可运行任务
             raise RuntimeError("No EgoAllo worker could be launched under the current VRAM budget.")
     # cleanup coordinator-generated task files
     for f in temp_files:
