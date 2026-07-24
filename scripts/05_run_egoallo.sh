@@ -25,6 +25,17 @@ PY_SCRIPT="$SCRIPT_DIR/05_run_egoallo_from_head.py"
 
 PYTHON_BIN="${PYTHON_EXECUTABLE:-python3}"
 
+if [ -z "${PYTHONPYCACHEPREFIX:-}" ]; then
+    SEGMENT_OUT_ABS="$(mkdir -p "$SEGMENT_OUT_ROOT" && cd "$SEGMENT_OUT_ROOT" && pwd)"
+    OUTPUT_ROOT="$(cd "$SEGMENT_OUT_ABS/.." && pwd)"
+    export PYTHONPYCACHEPREFIX="$OUTPUT_ROOT/tmp/pycache"
+    export EGOALLO_JAX_CACHE_LOG="${EGOALLO_JAX_CACHE_LOG:-$OUTPUT_ROOT/tmp/jax_cache_hits.log}"
+fi
+mkdir -p "$PYTHONPYCACHEPREFIX"
+if [ -n "${EGOALLO_JAX_CACHE_LOG:-}" ]; then
+    mkdir -p "$(dirname "$EGOALLO_JAX_CACHE_LOG")"
+fi
+
 EGOALLO_CHECKPOINT_DIR_VALUE="${EGOALLO_CHECKPOINT_DIR:-}"
 SMPLH_NPZ_PATH_VALUE="${SMPLH_NPZ_PATH:-${EGOALLO_MODEL_NPZ:-}}"
 MODEL_CONFIG_PATH_VALUE="${EGOALLO_MODEL_CONFIG_PATH:-}"
@@ -35,8 +46,8 @@ if [ ! -f "$PY_SCRIPT" ]; then
     exit 1
 fi
 
-# EGOALLO_ROOT 只作为 Python 脚本的 fallback 源码路径。
-# 这里不要提前加入 PYTHONPATH，否则会覆盖 conda/site-packages 的优先级。
+# EGOALLO_ROOT 会传给 Python 脚本，作为源码优先导入时的路径。
+# 不在这里提前修改 PYTHONPATH，避免影响其他环境包的解析。
 if [ -n "${EGOALLO_ROOT:-}" ] && [ ! -d "$EGOALLO_ROOT" ]; then
     echo "❌ EGOALLO_ROOT 不存在: $EGOALLO_ROOT"
     exit 1
@@ -110,10 +121,6 @@ CMD=(
     --floor-z "${EGOALLO_FLOOR_Z:-0.0}"
     --expected-head-height-min "${EGOALLO_EXPECTED_HEAD_HEIGHT_MIN:-1.0}"
     --expected-head-height-max "${EGOALLO_EXPECTED_HEAD_HEIGHT_MAX:-2.2}"
-    --parallel-workers "${EGOALLO_PARALLEL_WORKERS:-1}"
-    --available-vram-gb "${EGOALLO_AVAILABLE_VRAM_GB:-0}"
-    --estimated-model-vram-gb "${EGOALLO_ESTIMATED_MODEL_VRAM_GB:-6.0}"
-    --estimated-vram-gb-per-frame "${EGOALLO_ESTIMATED_VRAM_GB_PER_FRAME:-0.020}"
 )
 
 if [ -n "${EGOALLO_END_INDEX:-}" ]; then

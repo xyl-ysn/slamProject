@@ -2,16 +2,58 @@
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import json
 import os
-import subprocess
+import shutil
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+_DEFAULT_JAX_CACHE_DIR = Path(os.path.expanduser("~/.cache/egoallo/jax_compilation_cache")).resolve()
+
+
+def _bootstrap_jax_compilation_cache() -> Path:
+    cache_dir = Path(
+        os.getenv(
+            "EGOALLO_JAX_COMPILATION_CACHE_DIR",
+            os.getenv(
+                "JAX_COMPILATION_CACHE_DIR",
+                str(_DEFAULT_JAX_CACHE_DIR),
+            ),
+        )
+    ).expanduser().resolve()
+
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"[JAX CACHE] unable to create cache dir {cache_dir!s}: {e}")
+
+    os.environ.setdefault("JAX_ENABLE_COMPILATION_CACHE", "true")
+    os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", str(cache_dir))
+    os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "0")
+    os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES", "-1")
+    os.environ.setdefault(
+        "JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES",
+        "xla_gpu_per_fusion_autotune_cache_dir",
+    )
+
+    if os.getenv("EGOALLO_JAX_CACHE_DEBUG", "0") not in {"0", "false", "False"}:
+        print(
+            "[JAX CACHE] JAX persistent compilation cache configured before import; "
+            f"dir={os.environ['JAX_COMPILATION_CACHE_DIR']}",
+        )
+
+    return cache_dir
+
+
+_BOOTSTRAPPED_JAX_CACHE_DIR = _bootstrap_jax_compilation_cache()
 
 # 本脚本固定放在 project/scripts/05_run_egoallo_from_head.py。
-# 如果 conda 环境已经安装 egoallo，则不需要 EGOALLO_ROOT；直接 import egoallo。
-# 如果未安装，也可以通过 EGOALLO_ROOT 临时加入 PYTHONPATH。
+# 优先尝试从源码路径导入 egoallo；仅当源码导入失败时才回退到 conda/site-packages。
 SCRIPT_PATH = Path(__file__).resolve()
 SCRIPT_DIR = SCRIPT_PATH.parent
 PROJECT_ROOT = SCRIPT_DIR.parent
@@ -41,11 +83,12 @@ def _normalize_checkpoint_dir(path: Path | None) -> Path | None:
     return path
 
 
-# 可选：只有在 conda 环境无法 import egoallo 时，才使用 EGOALLO_ROOT 作为源码 fallback。
+# 可选：优先使用 EGOALLO_ROOT 对应源码目录作为主逻辑；仅当源码导入失败时，再回退到 conda/site-packages。
 EGOALLO_REPO = _env_path("EGOALLO_ROOT")
 EGOALLO_CHECKPOINT_DIR = _normalize_checkpoint_dir(_env_path("EGOALLO_CHECKPOINT_DIR"))
 SMPLH_NPZ_PATH = _env_path("SMPLH_NPZ_PATH", _env_path("EGOALLO_MODEL_NPZ"))
 EGOALLO_MODEL_CONFIG_PATH = _env_path("EGOALLO_MODEL_CONFIG_PATH")
+EGOALLO_EGO_CONFIG_PATH = _env_path("EGOALLO_EGO_CONFIG_PATH")
 EGOALLO_SOURCE_LABEL = "conda/site-packages"
 
 import numpy as np
@@ -54,6 +97,7 @@ import yaml
 
 
 def _import_egoallo_modules():
+    from egoallo import __file__ as _egoallo_file
     from egoallo import fncsmpl as _fncsmpl
     from egoallo import fncsmpl_extensions as _fncsmpl_extensions
     from egoallo.guidance_optimizer_jax import GuidanceMode as _GuidanceMode
@@ -62,6 +106,7 @@ def _import_egoallo_modules():
     from egoallo.transforms import SE3 as _SE3
     from egoallo.transforms import SO3 as _SO3
     return (
+        _egoallo_file,
         _fncsmpl,
         _fncsmpl_extensions,
         _GuidanceMode,
@@ -72,34 +117,83 @@ def _import_egoallo_modules():
     )
 
 
+def _remove_from_sys_path(path: str) -> None:
+    while True:
+        try:
+            idx = sys.path.index(path)
+        except ValueError:
+            return
+        del sys.path[idx]
+
+
+def _clear_egoallo_modules() -> None:
+    for name in list(sys.modules):
+        if name == "egoallo" or name.startswith("egoallo."):
+            del sys.modules[name]
+
+
+def _egoallo_import_candidate_paths(repo: Path) -> list[str]:
+    paths: list[str] = []
+    for candidate in [repo / "src", repo]:
+        if candidate.is_dir():
+            candidate_str = str(candidate)
+            if candidate_str not in paths:
+                paths.append(candidate_str)
+    return paths
+
+
+def _module_under_path(module_file: str | None, candidate_path: str) -> bool:
+    if not module_file:
+        return False
+    try:
+        module_real = Path(module_file).resolve()
+        candidate_real = Path(candidate_path).resolve()
+        return str(module_real).startswith(str(candidate_real))
+    except Exception:
+        return False
+
+
 def _load_egoallo_modules_with_fallback():
     global EGOALLO_SOURCE_LABEL
+    source_exc: Exception | None = None
+    source_label: str = "conda/site-packages"
+    if EGOALLO_REPO is not None:
+        if not EGOALLO_REPO.exists():
+            raise FileNotFoundError(f"EGOALLO_ROOT does not exist: {EGOALLO_REPO}")
+        for candidate in _egoallo_import_candidate_paths(EGOALLO_REPO):
+            if candidate not in sys.path:
+                sys.path.insert(0, candidate)
+            try:
+                modules = _import_egoallo_modules()
+                egoallo_file = modules[0]
+                if _module_under_path(egoallo_file, candidate):
+                    EGOALLO_SOURCE_LABEL = f"source {EGOALLO_REPO} (via {candidate})"
+                    return modules
+                raise RuntimeError(
+                    f"Imported egoallo from {egoallo_file}, not under expected candidate path {candidate}"
+                )
+            except Exception as source_error:
+                source_exc = source_error
+                source_label = f"source {EGOALLO_REPO} (via {candidate})"
+                _remove_from_sys_path(candidate)
+            _clear_egoallo_modules()
+
     try:
         modules = _import_egoallo_modules()
         EGOALLO_SOURCE_LABEL = "conda/site-packages"
         return modules
-    except Exception as first_exc:
-        if EGOALLO_REPO is None:
+    except Exception as second_exc:
+        if source_exc is None:
             raise ModuleNotFoundError(
-                "Cannot import egoallo from the current environment, and no EGOALLO_ROOT was provided."
-            ) from first_exc
-        if not EGOALLO_REPO.exists():
-            raise FileNotFoundError(f"EGOALLO_ROOT does not exist: {EGOALLO_REPO}") from first_exc
-        repo_str = str(EGOALLO_REPO)
-        if repo_str not in sys.path:
-            sys.path.insert(0, repo_str)
-        try:
-            modules = _import_egoallo_modules()
-            EGOALLO_SOURCE_LABEL = f"fallback source {EGOALLO_REPO}"
-            return modules
-        except Exception as second_exc:
-            raise ModuleNotFoundError(
-                "Cannot import egoallo from conda or fallback source. "
-                f"Fallback source: {EGOALLO_REPO}"
+                "Cannot import egoallo from current conda/site-packages environment."
             ) from second_exc
+        raise ModuleNotFoundError(
+            f"Cannot import egoallo from {source_label} and conda/site-packages."
+        ) from source_exc
 
 
 (
+    _egoallo_file,
     fncsmpl,
     fncsmpl_extensions,
     GuidanceMode,
@@ -108,6 +202,23 @@ def _load_egoallo_modules_with_fallback():
     SE3,
     SO3,
 ) = _load_egoallo_modules_with_fallback()
+
+import egoallo
+import egoallo.fncsmpl_jax as fncsmpl_jax
+import jax
+
+
+class GuidanceRuntime:
+    def __init__(self, body_model):
+        self.jax_body_model = fncsmpl_jax.SmplhModel(
+            faces=jax.device_put(body_model.faces.cpu().numpy()),
+            J_regressor=jax.device_put(body_model.J_regressor.cpu().numpy()),
+            parent_indices=jax.device_put(np.asarray(body_model.parent_indices)),
+            weights=jax.device_put(body_model.weights.cpu().numpy()),
+            posedirs=jax.device_put(body_model.posedirs.cpu().numpy()),
+            v_template=jax.device_put(body_model.v_template.cpu().numpy()),
+            shapedirs=jax.device_put(body_model.shapedirs.cpu().numpy()),
+        )
 
 
 @dataclasses.dataclass
@@ -147,6 +258,8 @@ class Args:
 
     floor_z: float = 0.0
     model_config_path: Path | None = EGOALLO_MODEL_CONFIG_PATH
+    ego_config_path: Path | None = EGOALLO_EGO_CONFIG_PATH
+    ego_compile_model: bool = False
 
     save_traj: bool = True
     save_args: bool = True
@@ -155,26 +268,6 @@ class Args:
 
     expected_head_height_min: float = 1.0
     expected_head_height_max: float = 2.2
-
-    parallel_workers: int = 1
-    """Number of separate worker processes to run EgoAllo segments in parallel."""
-
-    available_vram_gb: float = 0.0
-    """VRAM budget for concurrent EgoAllo workers. <=0 disables memory-budget scheduling."""
-
-    estimated_model_vram_gb: float = 6.0
-    """Conservative fixed VRAM estimate for one EgoAllo worker process."""
-
-    estimated_vram_gb_per_frame: float = 0.020
-    """Conservative extra VRAM estimate per inference frame."""
-
-    worker_task_file: Path | None = None
-    worker_segment_index: int | None = None
-    worker_target_start: int | None = None
-    worker_target_end: int | None = None
-    worker_infer_start: int | None = None
-    worker_infer_end: int | None = None
-    worker_crop_offset: int | None = None
 
 
 T_CAMERA_CPF = np.array(
@@ -226,14 +319,16 @@ def load_custom_transforms(traj_root: Path, device: torch.device):
     return T_torch, timestamps_torch, timestamps_np
 
 
-def load_denoiser_with_config(checkpoint_dir: Path, model_config_path: Path | None = EGOALLO_MODEL_CONFIG_PATH):
+def load_denoiser_with_config(
+    checkpoint_dir: Path,
+    model_config_path: Path | None = EGOALLO_MODEL_CONFIG_PATH,
+    compile_model: bool = False,
+):
     from egoallo.inference_utils import load_denoiser as original_load_denoiser
-    import os
 
     checkpoint_dir = Path(checkpoint_dir).expanduser().resolve()
     if model_config_path is None:
-        experiment_dir = checkpoint_dir.parent
-        model_config_path = experiment_dir / "model_config.yaml"
+        model_config_path = checkpoint_dir.parent / "model_config.yaml"
     else:
         model_config_path = Path(model_config_path).expanduser().resolve()
 
@@ -245,12 +340,41 @@ def load_denoiser_with_config(checkpoint_dir: Path, model_config_path: Path | No
     if not model_config_path.exists():
         raise FileNotFoundError(f"Model config not found: {model_config_path}")
 
-    original_cwd = os.getcwd()
-    os.chdir(model_config_path.parent)
+    supported_params = set(inspect.signature(original_load_denoiser).parameters.keys())
+    call_kwargs = {}
+    if "model_config_path" in supported_params:
+        call_kwargs["model_config_path"] = model_config_path
+    if "compile_model" in supported_params:
+        call_kwargs["compile_model"] = compile_model
+
+    default_model_config = checkpoint_dir.parent / "model_config.yaml"
+    restore_backup = None
+    replaced_default_config = False
+    if model_config_path != default_model_config and "model_config_path" not in supported_params:
+        restore_backup = default_model_config.with_suffix(default_model_config.suffix + ".egoop_backup")
+        if restore_backup.exists():
+            raise FileExistsError(f"Cannot temporarily replace model config; backup path already exists: {restore_backup}")
+
+        if default_model_config.exists():
+            shutil.move(default_model_config, restore_backup)
+            restore_backup = restore_backup
+            replaced_default_config = True
+        else:
+            restore_backup = None
+
+        shutil.copy2(model_config_path, default_model_config)
+        replaced_default_config = True
+
     try:
-        return original_load_denoiser(checkpoint_dir)
+        return original_load_denoiser(checkpoint_dir, **call_kwargs)
     finally:
-        os.chdir(original_cwd)
+        if "model_config_path" not in supported_params and replaced_default_config:
+            if default_model_config.exists():
+                default_model_config.unlink()
+            if restore_backup is not None:
+                restore_backup_path = default_model_config.with_suffix(default_model_config.suffix + ".egoop_backup")
+                if restore_backup_path.exists():
+                    shutil.move(restore_backup_path, default_model_config)
 
 
 def print_head_height_stats_once(T_world_cpf: torch.Tensor, floor_z: float, expected_min: float, expected_max: float) -> None:
@@ -282,6 +406,300 @@ def maybe_slice_hamer(all_hamer, hamer_path: Path, pose_timesteps: torch.Tensor,
     pose_timesteps_np = pose_timesteps.detach().cpu().numpy()
     segment_ts = tuple(float(x) for x in pose_timesteps_np[start + 1 : start + length + 1])
     return CorrespondedHamerDetections.load(hamer_path, segment_ts).to(device)
+
+
+def load_ego_config(config_path: Path | None) -> dict[str, Any]:
+    defaults = {
+        "sampling": {
+            "num_steps": 30,
+            "schedule": "quadratic",
+            "window_size": 128,
+            "overlap_size": 32,
+            "keep_intermediate_states": False,
+            "cache_clear_every_steps": 0,
+            "use_expanded_window_tiles": False,
+        },
+        "guidance": {
+            "inner_repeat": 1,
+            "post_repeat": 1,
+            "early_stop_grad_norm": None,
+            "inner": {},
+            "post": {},
+        },
+        "constraint_optimization": {
+            "enabled": True,
+            "inner_max_iters": None,
+            "post_max_iters": None,
+            "inner_last_steps": 0,
+            "inner_step_frequency": 1,
+            "post_last_steps": 0,
+            "post_step_frequency": 1,
+            "post_timing_repeat": 0,
+            "bucket_t": 0,
+            "detection_bucket": 0,
+            "warmup_before_segments": False,
+            "enable_hand_constraints": True,
+            "enable_foot_constraints": False,
+            "enable_collision_constraints": False,
+            "enable_body_regularization": False,
+        },
+        "inference": {
+            "use_torch_compile": False,
+        },
+        "denoiser": {
+            "compile_model": False,
+        },
+    }
+    if config_path is None:
+        raise ValueError(
+            "EGOALLO_EGO_CONFIG_PATH is required. Please set it in env or pass --ego-config-path."
+        )
+    if not config_path.exists():
+        raise FileNotFoundError(f"Ego config not found: {config_path}")
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    if raw is None:
+        return defaults
+    if not isinstance(raw, dict):
+        raise ValueError(f"Ego config must be a YAML mapping: {config_path}")
+
+    merged = defaults.copy()
+    # body_mesh.yaml passes the EgoAllo config via:
+    #   config:
+    #     egoallo:
+    #       config:
+    #         ...
+    # Keep compatibility with legacy direct egoallo config by falling back to root-level sections.
+    direct_block = raw
+    config_block = raw.get("config")
+    if isinstance(config_block, dict):
+        direct_block = config_block
+
+    legacy_egoallo_cfg = direct_block.get("egoallo")
+    if isinstance(legacy_egoallo_cfg, dict):
+        nested_block = legacy_egoallo_cfg.get("config")
+        if isinstance(nested_block, dict):
+            direct_block = nested_block
+
+    for section, section_defaults in defaults.items():
+        section_values = direct_block.get(section, {})
+        if isinstance(section_values, dict):
+            merged[section] = {**section_defaults, **section_values}
+        else:
+            raise ValueError(f"Section '{section}' must be a mapping in {config_path}")
+    return merged
+
+
+def _plain_namespace(ns: Any) -> Any:
+    if isinstance(ns, SimpleNamespace):
+        return {k: _plain_namespace(v) for k, v in vars(ns).items()}
+    if isinstance(ns, dict):
+        return {str(k): _plain_namespace(v) for k, v in ns.items()}
+    if isinstance(ns, list):
+        return [_plain_namespace(v) for v in ns]
+    return ns
+
+
+def _coerce_optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        value_int = int(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"Expected int or null, got {value!r}") from e
+    return value_int
+
+
+def _coerce_optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        value_float = float(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"Expected float or null, got {value!r}") from e
+    return value_float
+
+
+def _extract_debug_timesteps(num_steps: int, schedule: str) -> Any:
+    num_steps_i = int(num_steps)
+    if schedule != "quadratic":
+        return np.arange(max(0, num_steps_i), dtype=np.int64)
+
+    ts_builder = getattr(run_sampling_with_stitching, "__globals__", {}).get("quadratic_ts")
+    if callable(ts_builder):
+        try:
+            return np.asarray(ts_builder(num_steps_i))
+        except Exception:
+            pass
+
+    if num_steps_i <= 0:
+        return np.array([], dtype=np.int64)
+    if num_steps_i == 1:
+        return np.array([1], dtype=np.int64)
+    return np.arange(num_steps_i - 1, -1, -1, dtype=np.int64)
+
+
+@contextmanager
+def timer(name: str):
+    yield
+
+
+def _coerce_int(value: Any, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"Expected int, got {value!r}") from e
+
+
+def _coerce_guidance_bucket_t(
+    value: Any,
+    target_segment_length: int,
+    context_frames: int,
+) -> int:
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return int(target_segment_length) + 2 * int(context_frames)
+    return _coerce_int(value, 0)
+
+
+def _build_effective_ego_config_view(
+    ego_config: dict[str, Any],
+    target_segment_length: int = 0,
+    context_frames: int = 0,
+):
+    sampling_cfg = ego_config.get("sampling", {})
+    if not isinstance(sampling_cfg, dict):
+        sampling_cfg = {}
+    guidance_cfg = ego_config.get("guidance", {})
+    if not isinstance(guidance_cfg, dict):
+        guidance_cfg = {}
+    guidance_inner_cfg = guidance_cfg.get("inner", {})
+    if not isinstance(guidance_inner_cfg, dict):
+        guidance_inner_cfg = {}
+    guidance_post_cfg = guidance_cfg.get("post", {})
+    if not isinstance(guidance_post_cfg, dict):
+        guidance_post_cfg = {}
+    constraint_cfg = ego_config.get("constraint_optimization", {})
+    if not isinstance(constraint_cfg, dict):
+        constraint_cfg = {}
+    denoiser_cfg = ego_config.get("denoiser", {})
+    if not isinstance(denoiser_cfg, dict):
+        denoiser_cfg = {}
+    inference_cfg = ego_config.get("inference", {})
+    if not isinstance(inference_cfg, dict):
+        inference_cfg = {}
+
+    return SimpleNamespace(
+        sampling=SimpleNamespace(
+            num_steps=_coerce_int(sampling_cfg.get("num_steps"), 30),
+            window_size=_coerce_int(sampling_cfg.get("window_size"), 128),
+            overlap_size=_coerce_int(sampling_cfg.get("overlap_size"), 32),
+            cache_clear_every_steps=_coerce_int(
+                sampling_cfg.get("cache_clear_every_steps"), 0
+            ),
+            use_expanded_window_tiles=bool(
+                sampling_cfg.get("use_expanded_window_tiles", False)
+            ),
+            keep_intermediate_states=bool(
+                sampling_cfg.get("keep_intermediate_states", False)
+            ),
+        ),
+        guidance=SimpleNamespace(
+            inner=SimpleNamespace(
+                max_iters=_coerce_optional_int(guidance_inner_cfg.get("max_iters"))
+            ),
+            post=SimpleNamespace(
+                max_iters=_coerce_optional_int(guidance_post_cfg.get("max_iters"))
+            ),
+            inner_repeat=_coerce_int(guidance_cfg.get("inner_repeat"), 1),
+            post_repeat=_coerce_int(guidance_cfg.get("post_repeat"), 1),
+            early_stop_grad_norm=guidance_cfg.get("early_stop_grad_norm", None),
+        ),
+        constraint_optimization=SimpleNamespace(
+            enabled=bool(constraint_cfg.get("enabled", True)),
+            inner_max_iters=_coerce_optional_int(
+                constraint_cfg.get("inner_max_iters")
+            ),
+            post_max_iters=_coerce_optional_int(
+                constraint_cfg.get("post_max_iters")
+            ),
+            inner_last_steps=_coerce_int(
+                constraint_cfg.get("inner_last_steps"), 0
+            ),
+            inner_step_frequency=_coerce_int(
+                constraint_cfg.get("inner_step_frequency"), 1
+            ),
+            post_last_steps=_coerce_int(
+                constraint_cfg.get("post_last_steps"), 0
+            ),
+            post_step_frequency=_coerce_int(
+                constraint_cfg.get("post_step_frequency"), 1
+            ),
+            post_timing_repeat=_coerce_int(
+                constraint_cfg.get("post_timing_repeat"), 0
+            ),
+            bucket_t=_coerce_guidance_bucket_t(
+                constraint_cfg.get("bucket_t"), target_segment_length, context_frames
+            ),
+            detection_bucket=_coerce_int(
+                constraint_cfg.get("detection_bucket"), 0
+            ),
+            warmup_before_segments=bool(
+                constraint_cfg.get("warmup_before_segments", False)
+            ),
+            enable_hand_constraints=bool(
+                constraint_cfg.get("enable_hand_constraints", True)
+            ),
+            enable_foot_constraints=bool(
+                constraint_cfg.get("enable_foot_constraints", False)
+            ),
+            enable_collision_constraints=bool(
+                constraint_cfg.get("enable_collision_constraints", False)
+            ),
+            enable_body_regularization=bool(
+                constraint_cfg.get("enable_body_regularization", False)
+            ),
+        ),
+        inference=SimpleNamespace(
+            use_torch_compile=bool(
+                inference_cfg.get("use_torch_compile", denoiser_cfg.get("compile_model", False))
+            )
+        ),
+    )
+
+
+def _write_ego_runtime_report(
+    output_dir: Path,
+    args: Args,
+    ego_config_path: Path | None,
+    ego_config_raw: dict[str, Any],
+    ego_config_effective: SimpleNamespace,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report_path = output_dir / "egoallo_runtime_ego_config.json"
+    resolved_model_config = None
+    if args.model_config_path is not None:
+        resolved_model_config = str(Path(args.model_config_path).expanduser().resolve())
+    report = {
+        "resolved_paths": {
+            "ego_root_repo": str(EGOALLO_REPO) if EGOALLO_REPO is not None else None,
+            "egoallo_source": EGOALLO_SOURCE_LABEL,
+            "ego_config_path": str(ego_config_path) if ego_config_path is not None else None,
+            "model_config_path": resolved_model_config,
+            "project_root": str(args.project_root),
+            "output_dir": str(output_dir),
+        },
+        "environment": {
+            "EGOALLO_ROOT": os.getenv("EGOALLO_ROOT"),
+            "EGOALLO_EGO_CONFIG_PATH": os.getenv("EGOALLO_EGO_CONFIG_PATH"),
+            "EGOALLO_MODEL_CONFIG_PATH": os.getenv("EGOALLO_MODEL_CONFIG_PATH"),
+            "EGOALLO_CHECKPOINT_DIR": os.getenv("EGOALLO_CHECKPOINT_DIR"),
+        },
+        "ego_config_raw": _plain_namespace(ego_config_raw),
+        "ego_config_used": _plain_namespace(ego_config_effective),
+    }
+    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    return report_path
 
 
 @dataclasses.dataclass(frozen=True)
@@ -335,307 +753,6 @@ def build_segment_tasks(args: Args, max_output_frames: int) -> tuple[list[Segmen
         segment_index += 1
 
     return tasks, final_end
-
-
-def worker_task_from_args(args: Args) -> SegmentTask | None:
-    fields = (
-        args.worker_segment_index,
-        args.worker_target_start,
-        args.worker_target_end,
-        args.worker_infer_start,
-        args.worker_infer_end,
-        args.worker_crop_offset,
-    )
-    if all(v is None for v in fields):
-        return None
-    if any(v is None for v in fields):
-        raise ValueError("Worker segment args must be provided together.")
-    return SegmentTask(
-        segment_index=int(args.worker_segment_index),
-        target_start=int(args.worker_target_start),
-        target_end=int(args.worker_target_end),
-        infer_start=int(args.worker_infer_start),
-        infer_end=int(args.worker_infer_end),
-        crop_offset=int(args.worker_crop_offset),
-    )
-
-
-def _parse_worker_tasks_file(worker_task_path: Path) -> list[SegmentTask]:
-    with worker_task_path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-    if isinstance(data, dict):
-        tasks_payload = data.get("tasks", [])
-    else:
-        tasks_payload = data
-
-    if not isinstance(tasks_payload, list):
-        raise ValueError(f"worker task file must contain a list, got {type(tasks_payload)}: {worker_task_path}")
-    tasks: list[SegmentTask] = []
-    for i, item in enumerate(tasks_payload):
-        if not isinstance(item, dict):
-            raise ValueError(f"worker task entry {i} must be a dict: {item!r}")
-        required = (
-            "segment_index",
-            "target_start",
-            "target_end",
-            "infer_start",
-            "infer_end",
-            "crop_offset",
-        )
-        missing = [k for k in required if k not in item]
-        if missing:
-            raise ValueError(f"worker task entry {i} missing keys {missing} in {worker_task_path}")
-        tasks.append(
-            SegmentTask(
-                segment_index=int(item["segment_index"]),
-                target_start=int(item["target_start"]),
-                target_end=int(item["target_end"]),
-                infer_start=int(item["infer_start"]),
-                infer_end=int(item["infer_end"]),
-                crop_offset=int(item["crop_offset"]),
-            )
-        )
-    return tasks
-
-
-def worker_tasks_from_args(args: Args) -> list[SegmentTask] | None:
-    task_file = args.worker_task_file
-    task_from_args = worker_task_from_args(args)
-
-    if task_file is not None and task_from_args is not None:
-        raise ValueError("Provide only worker_task_file or worker_segment_* args, not both.")
-
-    if task_file is not None:
-        if not task_file.exists():
-            raise FileNotFoundError(f"worker task file not found: {task_file}")
-        return _parse_worker_tasks_file(task_file)
-
-    if task_from_args is not None:
-        return [task_from_args]
-    return None
-
-
-def estimate_segment_vram_gb(args: Args, task: SegmentTask) -> float:
-    return float(args.estimated_model_vram_gb) + float(args.estimated_vram_gb_per_frame) * float(task.infer_length)
-
-
-def estimate_worker_vram_gb(args: Args, tasks: list[SegmentTask]) -> float:
-    if not tasks:
-        return 0.0
-    return max(estimate_segment_vram_gb(args, task) for task in tasks)
-
-
-def _append_bool_arg(cmd: list[str], name: str, value: bool) -> None:
-    cmd.append(f"--{name}" if bool(value) else f"--no-{name}")
-
-
-def build_worker_command(args: Args, tasks: list[SegmentTask], worker_task_file: Path | None = None) -> list[str]:
-    cmd = [
-        sys.executable,
-        str(SCRIPT_PATH),
-        "--traj-root", str(args.traj_root),
-        "--output-dir", str(args.output_dir),
-        "--checkpoint-dir", str(args.checkpoint_dir),
-        "--model-config-path", str(args.model_config_path),
-        "--smplh-npz-path", str(args.smplh_npz_path),
-        "--glasses-x-angle-offset", str(args.glasses_x_angle_offset),
-        "--traj-length", str(args.traj_length),
-        "--context-frames", str(args.context_frames),
-        "--start-index", str(args.start_index),
-        "--segment-index-offset", str(args.segment_index_offset),
-        "--num-samples", str(args.num_samples),
-        "--guidance-mode", str(args.guidance_mode),
-        "--floor-z", str(args.floor_z),
-        "--expected-head-height-min", str(args.expected_head_height_min),
-        "--expected-head-height-max", str(args.expected_head_height_max),
-        "--parallel-workers", "1",
-        "--available-vram-gb", "0",
-        "--estimated-model-vram-gb", str(args.estimated_model_vram_gb),
-        "--estimated-vram-gb-per-frame", str(args.estimated_vram_gb_per_frame),
-    ]
-    if args.hamer_outputs_path is not None:
-        cmd.extend(["--hamer-outputs-path", str(args.hamer_outputs_path)])
-    if args.end_index is not None:
-        cmd.extend(["--end-index", str(args.end_index)])
-    _append_bool_arg(cmd, "save-only-center", args.save_only_center)
-    _append_bool_arg(cmd, "guidance-inner", args.guidance_inner)
-    _append_bool_arg(cmd, "guidance-post", args.guidance_post)
-    _append_bool_arg(cmd, "save-traj", args.save_traj)
-    _append_bool_arg(cmd, "save-args", args.save_args)
-    if args.empty_cache_each_segment:
-        cmd.append("--empty-cache-each-segment")
-    if args.allow_tf32:
-        cmd.append("--allow-tf32")
-
-    if worker_task_file is not None:
-        cmd.extend(["--worker-task-file", str(worker_task_file)])
-    elif len(tasks) == 1:
-        task = tasks[0]
-        cmd.extend(
-            [
-                "--worker-segment-index",
-                str(task.segment_index),
-                "--worker-target-start",
-                str(task.target_start),
-                "--worker-target-end",
-                str(task.target_end),
-                "--worker-infer-start",
-                str(task.infer_start),
-                "--worker-infer-end",
-                str(task.infer_end),
-                "--worker-crop-offset",
-                str(task.crop_offset),
-            ]
-        )
-    else:
-        raise ValueError("build_worker_command requires either worker_task_file or one worker task.")
-    return cmd
-
-
-def _write_worker_task_file(output_dir: Path, worker_id: int, tasks: list[SegmentTask]) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    task_path = output_dir / f"__egoallo_worker_{worker_id}_tasks.json"
-    payload = [dataclasses.asdict(task) for task in tasks]
-    task_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    return task_path
-
-
-def run_parallel_coordinator(args: Args) -> None:
-    head_path = args.traj_root / "head_trajectory.npy"
-    if not head_path.exists():
-        raise FileNotFoundError(head_path)
-    T_np = np.load(head_path, mmap_mode="r")
-    if T_np.ndim != 3 or T_np.shape[1:] != (4, 4):
-        raise ValueError(f"head_trajectory.npy should be [N,4,4], got {T_np.shape}")
-    max_output_frames = int(T_np.shape[0] - 1)
-    if args.start_index < 0 or args.start_index >= max_output_frames:
-        raise ValueError(f"start_index must be in [0, {max_output_frames - 1}], got {args.start_index}")
-
-    tasks, final_end = build_segment_tasks(args, max_output_frames)
-    max_workers = max(1, int(args.parallel_workers))
-    budget = float(args.available_vram_gb)
-
-    print(f"{T_np.shape=}")
-    print(f"total output frames={max_output_frames}, run range=[{args.start_index}, {final_end})")
-    print(f"target segment length={args.traj_length}")
-    print(f"context frames={args.context_frames}, save_only_center={args.save_only_center}")
-    print(f"parallel_workers={max_workers}, available_vram_gb={budget:.3f}")
-    print(
-        "VRAM estimate: "
-        f"{args.estimated_model_vram_gb:.3f} GB/process + "
-        f"{args.estimated_vram_gb_per_frame:.4f} GB/frame"
-    )
-
-    if budget > 0:
-        for task in tasks:
-            est = estimate_segment_vram_gb(args, task)
-            if est > budget:
-                raise RuntimeError(
-                    f"Segment {task.segment_index} estimated VRAM {est:.3f} GB exceeds "
-                    f"available_vram_gb={budget:.3f}. Reduce segment/context length or increase budget."
-                )
-
-    if not tasks:
-        print("[EgoAllo parallel] no tasks to run.")
-        return
-
-    num_workers = min(max_workers, len(tasks))
-    task_groups: list[list[SegmentTask]] = [[] for _ in range(num_workers)]
-    for i, task in enumerate(tasks):
-        task_groups[i % num_workers].append(task)
-    task_groups = [g for g in task_groups if g]
-
-    pending = []
-    for worker_idx, group in enumerate(task_groups):
-        est = estimate_worker_vram_gb(args, group)
-        if budget > 0 and est > budget:
-            raise RuntimeError(
-                f"Worker {worker_idx} estimated VRAM {est:.3f} GB exceeds "
-                f"available_vram_gb={budget:.3f} for task batch."
-            )
-        worker_task_file = _write_worker_task_file(
-            Path(args.output_dir) if args.output_dir is not None else args.traj_root / "ego_tmp",
-            worker_idx,
-            group,
-        )
-        target_summary = f"{group[0].target_start}-{group[-1].target_end}"
-        infer_summary = f"{group[0].infer_start}-{group[-1].infer_end}"
-        pending.append({
-            "worker_id": int(worker_idx),
-            "tasks": group,
-            "task_file": worker_task_file,
-            "worker_vram": float(est),
-            "summary": f"segment={group[0].segment_index}-{group[-1].segment_index}, target={target_summary}, infer={infer_summary}",
-        })
-
-    running: list[dict[str, object]] = []
-    completed = 0
-    temp_files: set[Path] = {item["task_file"] for item in pending}
-
-    while pending or running:
-        still_running = []
-        for item in running:
-            proc = item["proc"]
-            assert isinstance(proc, subprocess.Popen)
-            code = proc.poll()
-            if code is None:
-                still_running.append(item)
-                continue
-            if code != 0:
-                raise subprocess.CalledProcessError(code, item["cmd"])
-            task_count = len(item["tasks"]) if isinstance(item["tasks"], list) else 0
-            completed += task_count
-            summary = item["summary"] if isinstance(item["summary"], str) else ""
-            print(
-                f"[EgoAllo parallel] completed worker {item['worker_id']} ({completed}/{len(tasks)} segments). "
-                f"{summary}",
-                flush=True,
-            )
-        running = still_running
-
-        used_vram = sum(float(item["worker_vram"]) for item in running)
-        launched = False
-        while pending and len(running) < max_workers:
-            item = pending[0]
-            est = float(item["worker_vram"])
-            if budget > 0 and used_vram + est > budget:
-                break
-            pending.pop(0)
-            task_file = item["task_file"]
-            assert isinstance(task_file, Path)
-            cmd = build_worker_command(args, item["tasks"], task_file)
-            print(
-                f"[EgoAllo parallel] launch worker {item['worker_id']}: "
-                f"{item['summary']} "
-                f"estimated_vram={est:.3f}GB used_after={used_vram + est:.3f}GB",
-                flush=True,
-            )
-            proc = subprocess.Popen(cmd, env=os.environ.copy())
-            running.append(
-                {
-                    "proc": proc,
-                    "worker_id": item["worker_id"],
-                    "tasks": item["tasks"],
-                    "worker_vram": item["worker_vram"],
-                    "summary": item["summary"],
-                    "task_file": item["task_file"],
-                    "cmd": cmd,
-                }
-            )
-            used_vram += est
-            launched = True
-
-        if not launched and running:
-            time.sleep(1.0)
-        elif pending and not running:
-            raise RuntimeError("No EgoAllo worker could be launched under the current VRAM budget.")
-    # cleanup coordinator-generated task files
-    for f in temp_files:
-        if f.is_file():
-            f.unlink(missing_ok=True)
-
-    print("\nDone.")
-
 
 
 def _slice_time_tensor(x: torch.Tensor, start: int, end: int, infer_len: int) -> torch.Tensor:
@@ -757,10 +874,6 @@ def main(args: Args) -> None:
         raise ValueError(f"traj_length must be positive, got {args.traj_length}")
     if args.context_frames < 0:
         raise ValueError(f"context_frames must be >= 0, got {args.context_frames}")
-    worker_tasks = worker_tasks_from_args(args)
-    if worker_tasks is None and int(args.parallel_workers) > 1:
-        run_parallel_coordinator(args)
-        return
 
     device = torch.device("cuda")
     torch.set_grad_enabled(False)
@@ -779,29 +892,12 @@ def main(args: Args) -> None:
     if final_end <= args.start_index:
         raise ValueError(f"end_index must be > start_index, got {final_end} <= {args.start_index}")
 
-    if worker_tasks is not None:
-        tasks = worker_tasks
-        final_end_for_log = max(task.target_end for task in tasks)
-        if args.start_index < 0 or args.start_index >= tasks[0].infer_start + 1:
-            raise ValueError(f"start_index should not be inconsistent with worker task definitions: {args.start_index}")
-        if final_end_for_log <= args.start_index:
-            raise ValueError(
-                f"worker tasks final end must be > start_index, got {final_end_for_log} <= {args.start_index}"
-            )
-    else:
-        tasks, final_end_for_log = build_segment_tasks(args, max_output_frames)
+    tasks, final_end_for_log = build_segment_tasks(args, max_output_frames)
 
     print(f"{T_world_head.shape=}")
     print(f"total output frames={max_output_frames}, run range=[{args.start_index}, {final_end_for_log})")
     print(f"target segment length={args.traj_length}")
     print(f"context frames={args.context_frames}, save_only_center={args.save_only_center}")
-    if worker_tasks is not None and len(worker_tasks) == 1:
-        worker_task = worker_tasks[0]
-        print(
-            f"worker segment={worker_task.segment_index} "
-            f"target={worker_task.target_start}-{worker_task.target_end} "
-            f"infer={worker_task.infer_start}-{worker_task.infer_end}"
-        )
 
     T_camera_cpf = torch.from_numpy(T_CAMERA_CPF).to(device)
     T_world_cpf_all = T_world_head @ T_camera_cpf
@@ -825,39 +921,50 @@ def main(args: Args) -> None:
     if not smplh_npz_path.is_file():
         raise FileNotFoundError(f"SMPL-H model not found: {smplh_npz_path}")
 
-    print("\n[Resolved EgoAllo paths]")
-    print(f"  project_root: {args.project_root}")
-    print(f"  egoallo_source: {EGOALLO_SOURCE_LABEL}")
-    print(f"  checkpoint_dir: {checkpoint_dir}")
-    print(f"  model_config_path: {model_config_path}")
-    print(f"  smplh_npz_path: {smplh_npz_path}")
+    ego_config = load_ego_config(args.ego_config_path)
+    cfg = _build_effective_ego_config_view(
+        ego_config,
+        target_segment_length=args.traj_length,
+        context_frames=args.context_frames,
+    )
+    output_root = args.output_dir if args.output_dir is not None else args.traj_root / "ego_tmp"
+    runtime_report_path = _write_ego_runtime_report(
+        output_root, args, args.ego_config_path, ego_config, cfg
+    )
 
     print("\n[Load denoiser/body model once]")
-    t0 = time.time()
-    denoiser_network = load_denoiser_with_config(checkpoint_dir, model_config_path).to(device).eval()
+    compile_model_cfg = bool(ego_config["denoiser"].get("compile_model", False))
+    denoiser_network = load_denoiser_with_config(
+        checkpoint_dir,
+        model_config_path,
+        compile_model=bool(args.ego_compile_model) or compile_model_cfg,
+    ).to(device).eval()
     body_model = fncsmpl.SmplhModel.load(smplh_npz_path).to(device)
-    print(f"  loaded in {time.time() - t0:.2f}s")
 
-    worker_mode = worker_tasks is not None
-    if args.hamer_outputs_path is not None and not worker_mode:
+    inner_max_iters = _coerce_optional_int(cfg.constraint_optimization.inner_max_iters)
+    post_max_iters = _coerce_optional_int(cfg.constraint_optimization.post_max_iters)
+    build_guidance_runtime = (
+        bool(cfg.constraint_optimization.enabled)
+        and args.guidance_mode != "off"
+        and (
+            bool(args.guidance_inner)
+            and (inner_max_iters is None or inner_max_iters > 0)
+            or bool(args.guidance_post)
+            and (post_max_iters is None or post_max_iters > 0)
+        )
+    )
+    guidance_runtime = None
+    if build_guidance_runtime:
+        guidance_runtime = GuidanceRuntime(body_model)
+
+    if args.hamer_outputs_path is not None:
         if not args.hamer_outputs_path.is_file():
             raise FileNotFoundError(args.hamer_outputs_path)
         if args.guidance_mode == "no_hands":
             raise ValueError("--hamer-outputs-path was provided, but --guidance-mode=no-hands would ignore it.")
         print("\n[Load HaMeR detections once on CPU]")
-        t0 = time.time()
         # Use the same float32 timestamp path as the original per-segment script.
         # This avoids subtle timestamp matching differences for detections keyed by time.
-        pose_timesteps_np = pose_timesteps.detach().cpu().numpy()
-        all_pose_ts = tuple(float(x) for x in pose_timesteps_np[1:])
-        all_hamer = CorrespondedHamerDetections.load(args.hamer_outputs_path, all_pose_ts)
-        print(f"  loaded in {time.time() - t0:.2f}s")
-    elif args.hamer_outputs_path is not None and worker_mode:
-        if not args.hamer_outputs_path.is_file():
-            raise FileNotFoundError(args.hamer_outputs_path)
-        if args.guidance_mode == "no_hands":
-            raise ValueError("--hamer-outputs-path was provided, but --guidance-mode=no-hands would ignore it.")
-        print("\n[Worker mode] Load HaMeR detections once for all assigned segments.")
         pose_timesteps_np = pose_timesteps.detach().cpu().numpy()
         all_pose_ts = tuple(float(x) for x in pose_timesteps_np[1:])
         all_hamer = CorrespondedHamerDetections.load(args.hamer_outputs_path, all_pose_ts)
@@ -905,34 +1012,118 @@ def main(args: Args) -> None:
             )
 
         with torch.inference_mode():
-            traj = run_sampling_with_stitching(
-                denoiser_network,
-                body_model=body_model,
-                guidance_mode=args.guidance_mode,
-                guidance_inner=args.guidance_inner,
-                guidance_post=args.guidance_post,
-                Ts_world_cpf=Ts_world_cpf,
-                hamer_detections=hamer_detections,
-                aria_detections=aria_detections,
-                num_samples=args.num_samples,
-                device=device,
-                floor_z=args.floor_z,
-                guidance_verbose=False,
-            )
+            with timer("prepare"):
+                sampling_kwargs = {
+                    "body_model": body_model,
+                    "guidance_mode": args.guidance_mode,
+                    "guidance_inner": args.guidance_inner,
+                    "guidance_post": args.guidance_post,
+                    "Ts_world_cpf": Ts_world_cpf,
+                    "hamer_detections": hamer_detections,
+                    "aria_detections": aria_detections,
+                    "num_samples": args.num_samples,
+                    "device": device,
+                    "floor_z": args.floor_z,
+                    "guidance_verbose": False,
+                    "jax_body_model": None
+                    if guidance_runtime is None
+                    else guidance_runtime.jax_body_model,
+                }
+                # Optional sampling config fields supported by newer versions.
+                sampling_kwargs.update(
+                    {
+                        "num_steps": int(cfg.sampling.num_steps),
+                        "schedule": str(
+                            ego_config.get("sampling", {}).get("schedule", "quadratic")
+                        ),
+                        "window_size": int(cfg.sampling.window_size),
+                        "overlap_size": int(cfg.sampling.overlap_size),
+                        "keep_intermediate_states": bool(
+                            cfg.sampling.keep_intermediate_states
+                        ),
+                        "guidance_inner_max_iters": inner_max_iters,
+                        "guidance_post_max_iters": post_max_iters,
+                        "constraint_optimization_enabled": bool(
+                            cfg.constraint_optimization.enabled
+                        ),
+                        "constraint_optimization_inner_last_steps": _coerce_int(
+                            cfg.constraint_optimization.inner_last_steps, 0
+                        ),
+                        "constraint_optimization_inner_step_frequency": _coerce_int(
+                            cfg.constraint_optimization.inner_step_frequency, 1
+                        ),
+                        "constraint_optimization_post_last_steps": _coerce_int(
+                            cfg.constraint_optimization.post_last_steps, 0
+                        ),
+                        "constraint_optimization_post_step_frequency": _coerce_int(
+                            cfg.constraint_optimization.post_step_frequency, 1
+                        ),
+                        "constraint_optimization_post_timing_repeat": 0,
+                        "constraint_optimization_bucket_t": _coerce_int(
+                            cfg.constraint_optimization.bucket_t, 0
+                        ),
+                        "constraint_optimization_detection_bucket": _coerce_int(
+                            cfg.constraint_optimization.detection_bucket, 0
+                        ),
+                        "constraint_optimization_warmup_before_segments": bool(
+                            cfg.constraint_optimization.warmup_before_segments
+                        ),
+                        "constraint_optimization_enable_hand_constraints": bool(
+                            cfg.constraint_optimization.enable_hand_constraints
+                        ),
+                        "constraint_optimization_enable_foot_constraints": bool(
+                            cfg.constraint_optimization.enable_foot_constraints
+                        ),
+                        "constraint_optimization_enable_collision_constraints": bool(
+                            cfg.constraint_optimization.enable_collision_constraints
+                        ),
+                        "constraint_optimization_enable_body_regularization": bool(
+                            cfg.constraint_optimization.enable_body_regularization
+                        ),
+                        "guidance_inner_repeat": _coerce_optional_int(
+                            cfg.guidance.inner_repeat
+                        ),
+                        "guidance_post_repeat": _coerce_optional_int(
+                            cfg.guidance.post_repeat
+                        ),
+                        "guidance_early_stop_grad_norm": _coerce_optional_float(
+                            cfg.guidance.early_stop_grad_norm
+                        ),
+                        "return_timing": False,
+                    }
+                )
+                supported_sampling_params = set(
+                    inspect.signature(run_sampling_with_stitching).parameters.keys()
+                )
+                sampling_kwargs = {
+                    key: value for key, value in sampling_kwargs.items() if key in supported_sampling_params
+                }
 
-        save_segment(
-            args,
-            traj,
-            body_model,
-            Ts_world_cpf,
-            pose_timestamps_sec,
-            infer_start,
-            infer_length,
-            target_start,
-            target_length,
-            crop_offset,
-            segment_index,
-        )
+            with timer("sampling"):
+                sampled = run_sampling_with_stitching(denoiser_network, **sampling_kwargs)
+
+            if isinstance(sampled, tuple):
+                traj, stage_timing = sampled
+            else:
+                traj, stage_timing = sampled, None
+
+            with timer("post_guidance"):
+                pass
+
+        with timer("save"):
+            save_segment(
+                args,
+                traj,
+                body_model,
+                Ts_world_cpf,
+                pose_timestamps_sec,
+                infer_start,
+                infer_length,
+                target_start,
+                target_length,
+                crop_offset,
+                segment_index,
+            )
 
         del traj, hamer_detections
         if args.empty_cache_each_segment:

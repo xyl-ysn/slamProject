@@ -13,6 +13,10 @@ import traceback
 from datetime import datetime, timezone
 from typing import Any
 
+# Avoid creating scripts/__pycache__ during early imports before output_dir/tmp
+# is known. configure_python_pycache() re-enables bytecode under tmp/pycache.
+sys.dont_write_bytecode = True
+
 import yaml
 
 # 本文件固定放在 project/scripts/run_body_mesh.py
@@ -105,8 +109,7 @@ def build_subprocess_env(cfg: dict[str, Any]) -> dict[str, str]:
     env["PYTHON_EXECUTABLE"] = sys.executable
 
     # 只把项目脚本路径加入 PYTHONPATH。EgoAllo/GeoCalib 源码路径不在这里提前加入，
-    # 这样子脚本会优先使用 conda/site-packages 中已安装的包；只有 import 失败时，
-    # 才会根据 EGOALLO_ROOT/GEOCALIB_ROOT fallback 到 YAML 配置的源码目录。
+    # 对应子脚本内部会自行决定 import 优先级；这里保留源码/conda 的配置路径并透传给子脚本。
     prepend_pythonpath(env, [PROJECT_ROOT, SCRIPTS_DIR])
 
     egoallo_root = resolve_project_path(get_cfg(cfg, "model_sources.egoallo_root"))
@@ -117,8 +120,7 @@ def build_subprocess_env(cfg: dict[str, Any]) -> dict[str, str]:
     if geocalib_root is not None:
         env["GEOCALIB_ROOT"] = str(geocalib_root)
     if moge_root is not None:
-        # 只作为 MoGe 脚本 import 失败时的源码 fallback 路径。
-        # 不在总控脚本里提前覆盖 PYTHONPATH 的包优先级。
+        # 只作为源码路径传给下游脚本，实际源码/conda优先级由下游脚本自行控制。
         env["MOGE_ROOT"] = str(moge_root)
 
     env_path_map = {
@@ -234,6 +236,7 @@ def configure_python_pycache(env: dict[str, str], cfg: dict[str, Any], tmp_dir: 
     cache_dir.mkdir(parents=True, exist_ok=True)
     env["PYTHONPYCACHEPREFIX"] = str(cache_dir)
     sys.pycache_prefix = str(cache_dir)
+    sys.dont_write_bytecode = False
     print(f"[Python] pycache redirected to: {cache_dir}", flush=True)
     return cache_dir, cleanup_result
 
@@ -479,7 +482,6 @@ def main() -> None:
     stable_hands_jsonl = tmp_dir / "hawor_hands_for_egoallo_world_stable.jsonl"
     R_hawor_to_vggt_npy = tmp_dir / "R_hawor_to_vggt.npy"
     hamer_outputs_pkl_tmp = tmp_dir / "hamer_outputs.pkl"
-    debug_camera_jsonl = tmp_dir / "hawor_hands_camera_debug.jsonl"
 
     geocalib_gravity_npz = tmp_dir / "geocalib_gravity.npz"
     R_align_npy = tmp_dir / "R_align.npy"
@@ -575,7 +577,6 @@ def main() -> None:
         "--mano-left-pkl", str(mano_left),
         "--mano-right-pkl", str(mano_right),
         "--camera-frame-rotation-npy", str(R_hawor_to_vggt_npy),
-        "--debug-camera-jsonl", str(debug_camera_jsonl),
     ], env=env)
 
     # GeoCalib gravity：可选参数从 YAML 的 geocalib 段读取。
@@ -607,7 +608,7 @@ def main() -> None:
         if bool(get_cfg(cfg, "geocalib.viz_save_selected", False)):
             geocalib_cmd.append("--save-selected-viz")
 
-    # geocalib_root 是 fallback 源码路径，conda import 失败时才会用。
+    # geocalib_root 透传给 01_estimate_gravity_da3_geocalib.py，由其决定源码/conda回退逻辑。
     geocalib_root = env.get("GEOCALIB_ROOT")
     if geocalib_root:
         geocalib_cmd.extend(["--geocalib-root", geocalib_root])
@@ -804,8 +805,6 @@ def main() -> None:
             "--hamer-pkl-out", str(hamer_outputs_pkl_out),
             "--metadata-out", str(metric_scale_metadata_json),
             "--floor-z", str(get_cfg(cfg, "metric_scale.floor_z", 0.0)),
-            "--height-min", str(get_cfg(cfg, "metric_scale.height_min", 1.50)),
-            "--height-max", str(get_cfg(cfg, "metric_scale.height_max", 1.60)),
             "--scale-priority", scale_priority_csv,
             "--hand-scale-enabled", "1" if bool(get_cfg(cfg, "metric_scale.hand_fallback.enabled", True)) else "0",
             "--hand-scale-bones-json", str(hand_scale_bones_json),
@@ -839,17 +838,9 @@ def main() -> None:
             "--align-meta-for-scale", str(alignment_transform_npz),
         ]
 
-        metric_target_height = get_cfg(cfg, "metric_scale.target_height", None)
-        if metric_target_height is not None:
-            metric_scale_cmd.extend(["--target-height", str(metric_target_height)])
-
         height_fallback_target_height = get_cfg(cfg, "metric_scale.height_fallback.target_height", None)
         if height_fallback_target_height is not None:
             metric_scale_cmd.extend(["--height-fallback-target-height", str(height_fallback_target_height)])
-
-        metric_force_scale = get_cfg(cfg, "metric_scale.force_scale", None)
-        if metric_force_scale is not None:
-            metric_scale_cmd.extend(["--force-scale", str(metric_force_scale)])
 
         if bool(get_cfg(cfg, "metric_scale.frontend.enabled", True)):
             metric_scale_cmd.extend([
@@ -937,19 +928,20 @@ def main() -> None:
     env["EGOALLO_SAVE_ARGS"] = "1" if bool(get_cfg(cfg, "egoallo.save_args", True)) else "0"
     env["EGOALLO_EMPTY_CACHE_EACH_SEGMENT"] = "1" if bool(get_cfg(cfg, "egoallo.empty_cache_each_segment", False)) else "0"
     env["EGOALLO_ALLOW_TF32"] = "1" if bool(get_cfg(cfg, "egoallo.allow_tf32", False)) else "0"
-    env["EGOALLO_PARALLEL_WORKERS"] = str(get_cfg(cfg, "egoallo.parallel_workers", 1))
-    env["EGOALLO_AVAILABLE_VRAM_GB"] = str(get_cfg(cfg, "egoallo.available_vram_gb", 0))
-    env["EGOALLO_ESTIMATED_MODEL_VRAM_GB"] = str(get_cfg(cfg, "egoallo.estimated_model_vram_gb", 6.0))
-    env["EGOALLO_ESTIMATED_VRAM_GB_PER_FRAME"] = str(get_cfg(cfg, "egoallo.estimated_vram_gb_per_frame", 0.020))
 
     env["EGOALLO_EXPECTED_HEAD_HEIGHT_MIN"] = str(get_cfg(cfg, "egoallo.expected_head_height_min", 1.0))
     env["EGOALLO_EXPECTED_HEAD_HEIGHT_MAX"] = str(get_cfg(cfg, "egoallo.expected_head_height_max", 2.2))
+    env["EGOALLO_EGO_CONFIG_PATH"] = str(args.config.expanduser().resolve())
+    env["EGOALLO_JAX_CACHE_LOG"] = str(tmp_dir / "jax_cache_hits.log")
 
     end_index = get_cfg(cfg, "egoallo.end_index", None)
     if end_index is not None:
         env["EGOALLO_END_INDEX"] = str(end_index)
     else:
         env.pop("EGOALLO_END_INDEX", None)
+
+    if bool(get_cfg(cfg, "egoallo.disable_dlpack", False)):
+        env["EGOALLO_DISABLE_DLPACK"] = "1"
 
     segment_length = str(get_cfg(cfg, "egoallo.target_segment_length", 256))
     # EgoAllo 分段输出目录：只保存每段中心裁剪后的 .npz / _args.yaml，不和最终结果目录混在一起。

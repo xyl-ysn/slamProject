@@ -53,9 +53,9 @@ def _resolve_path(value: str | None, *, name: str, must_exist: bool = True) -> P
 
 
 def _resolve_geocalib_paths(args):
-    # geocalib_root 是可选的：
-    # - 如果 conda 环境已经能 import geocalib，则不用传；
-    # - 如果没有安装 geocalib，则通过 GEOCALIB_ROOT 或 --geocalib-root 加入 sys.path。
+    # geocalib_root 是可选的源码路径：
+    # - 如果设置且可用，优先插入 GEOCALIB_ROOT/--geocalib-root 进行源码导入；
+    # - 如果源码导入失败，再回退到当前 conda/site-packages。
     geocalib_root_value = args.geocalib_root or os.getenv("GEOCALIB_ROOT")
     geocalib_root = None
     if geocalib_root_value is not None and str(geocalib_root_value).strip() != "":
@@ -83,30 +83,45 @@ def _import_geocalib():
     return GeoCalib
 
 
-def _load_geocalib_class(geocalib_root: Path | None):
-    """Prefer the conda-installed geocalib; fall back to YAML/GEOCALIB_ROOT source."""
-    try:
-        GeoCalib = _import_geocalib()
-        print("GeoCalib import source: conda/site-packages")
-        return GeoCalib
-    except Exception as first_exc:
-        if geocalib_root is None:
-            raise ModuleNotFoundError(
-                "Cannot import geocalib from the current environment, and no GEOCALIB_ROOT/--geocalib-root was provided."
-            ) from first_exc
+def _clear_geocalib_modules() -> None:
+    for name in list(sys.modules):
+        if name == "geocalib" or name.startswith("geocalib."):
+            del sys.modules[name]
 
+
+def _load_geocalib_class(geocalib_root: Path | None):
+    """Prefer YAML/GEOCALIB_ROOT source; fall back to conda-installed geocalib."""
+    source_path = str(geocalib_root) if geocalib_root is not None else None
+    source_exc: Exception | None = None
+
+    if geocalib_root is not None:
         geocalib_root_str = str(geocalib_root)
         if geocalib_root_str not in sys.path:
             sys.path.insert(0, geocalib_root_str)
         try:
             GeoCalib = _import_geocalib()
-            print(f"GeoCalib import source: fallback source {geocalib_root}")
-            return GeoCalib
-        except Exception as second_exc:
+            print(f"GeoCalib import source: source {geocalib_root}")
+            return GeoCalib, f"source {geocalib_root}"
+        except Exception as first_exc:
+            source_exc = first_exc
+            if geocalib_root_str in sys.path:
+                del sys.path[sys.path.index(geocalib_root_str)]
+            _clear_geocalib_modules()
+
+    try:
+        GeoCalib = _import_geocalib()
+        print("GeoCalib import source: conda/site-packages")
+        return GeoCalib, "conda/site-packages"
+    except Exception as first_exc:
+        if geocalib_root is None:
             raise ModuleNotFoundError(
-                "Cannot import geocalib from conda or fallback source. "
-                f"Fallback source: {geocalib_root}"
-            ) from second_exc
+                "Cannot import geocalib from source (not provided) and conda/site-packages."
+            ) from first_exc
+        if source_exc is not None:
+            raise ModuleNotFoundError(
+                f"Cannot import geocalib from {source_path} and conda/site-packages."
+            ) from source_exc
+        raise ModuleNotFoundError("Cannot import geocalib from conda/site-packages.") from first_exc
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
 
@@ -557,7 +572,10 @@ def main():
         "--geocalib-root",
         type=str,
         default=None,
-        help="Optional GeoCalib source directory. If omitted, import geocalib from current conda environment.",
+        help=(
+            "Optional GeoCalib source directory. If provided, this is tried first; "
+            "falls back to current conda/site-packages on failure."
+        ),
     )
     parser.add_argument(
         "--geocalib-pinhole-weight",
@@ -643,7 +661,7 @@ def main():
     args = parser.parse_args()
 
     geocalib_repo, geocalib_weight_path = _resolve_geocalib_paths(args)
-    GeoCalib = _load_geocalib_class(geocalib_repo)
+    GeoCalib, geocalib_source = _load_geocalib_class(geocalib_repo)
 
     if args.device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -688,7 +706,7 @@ def main():
     )
 
     print(f"Project root: {PROJECT_ROOT}")
-    print(f"GeoCalib source: {geocalib_repo if geocalib_repo is not None else 'conda/site-packages'}")
+    print(f"GeoCalib source: {geocalib_source}")
     print(f"GeoCalib weight: {geocalib_weight_path}")
 
     model = GeoCalib(weights=str(geocalib_weight_path)).to(device)

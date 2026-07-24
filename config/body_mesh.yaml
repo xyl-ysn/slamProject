@@ -148,7 +148,7 @@ config: &body_mesh_config
     follow_frames: 2
     empty_policy: skip
 
-    viz_enabled: true
+    viz_enabled: false
     viz_dir_name: geocalib_viz
     viz_save_all_sampled: false
     viz_save_selected: false
@@ -171,6 +171,7 @@ config: &body_mesh_config
 
     # 最终写出 final_scene.ply 时做一次降采样。0 表示不降采样。
     # 02_apply_alignment_da3_geocalib.py 现在默认只输出 head_trajectory.npy，不再写中间 aligned_scene.ply。
+    #点云降采样
     final_scene_output_voxel_size: 0.003
 
     # 尺度估计优先级：
@@ -184,12 +185,6 @@ config: &body_mesh_config
       - height
       - none
 
-    # 旧的身高范围仍保留，主要给 height fallback 参考
-    height_min: 1.50
-    height_max: 1.60
-    target_height: null
-    force_scale: null
-
     # MoGe scale 后验检查：
     # 这里的 min/max 只用于 MoGe 的 p90 头高 sanity check。
     # hand scale 不用这个区间拒绝，只在 p90 头高超过 hand_fallback.max_p90_head_height 时缩小。
@@ -199,7 +194,7 @@ config: &body_mesh_config
       percentile: 90
 
       # 这里故意比 1.50-1.60 宽很多，避免弯腰/低头误杀 MoGe
-      min_valid_head_height: 1.20
+      min_valid_head_height: 0.80
       max_valid_head_height: 1.70
 
       reject_moge_if_invalid_height: true
@@ -341,7 +336,7 @@ config: &body_mesh_config
     # 例：target_segment_length=512, context_frames=30 时，
     #   第 2 段 target=512-1024，实际 infer=482-1054，最后只保存 512-1024。
     # 并行模式下，每段是独立 Python 进程；context_frames 不会读取上一段生成的人体 pose。
-    target_segment_length: 256
+    target_segment_length: 512
 
     # 每段推理时额外看前后多少帧。数值越大，边界上下文越多，但显存估算也越高。
     context_frames: 20
@@ -363,25 +358,75 @@ config: &body_mesh_config
     save_traj: true
     save_args: false
     empty_cache_each_segment: false
-    allow_tf32: false
-
-    # EgoAllo 多进程分片并行：
-    # - parallel_workers=1：原来的串行模式，一个进程按段依次跑。
-    # - parallel_workers>1：每个 segment 单独启动一个 Python worker 进程。
-    # - available_vram_gb>0 时启用显存预算调度；只有预计并发显存 <= available_vram_gb 才会启动新段。
-    # - 如果 parallel_workers 设置很大，但显存预算不够，只会启动预算允许的 worker 数。
-    # - 如果单个 segment 预计显存已经超过 available_vram_gb，会直接报错，需减小 segment/context 或提高预算。
-    # 估算公式：
-    #   estimated_model_vram_gb + estimated_vram_gb_per_frame * infer_length
-    # 其中 infer_length 约等于 target_segment_length + 2 * context_frames，中间/末尾段会按边界裁剪。
-    parallel_workers: 2
-    available_vram_gb: 12
-    estimated_model_vram_gb: 6.0
-    estimated_vram_gb_per_frame: 0.020
+    allow_tf32: true
 
     expected_head_height_min: 1.0
     expected_head_height_max: 2.2
 
+    # 以下参数会覆盖 EgoAllo 的采样与约束参数。
+    # 05_run_egoallo_from_head.py 直接从 body_mesh.yaml 读取该段配置。
+    config:
+      sampling:
+        # 模型扩散时间轴仍为 1000，实际采样运行 50 步
+        num_steps: 1000 
+        window_size: 128 
+        overlap_size: 32 
+        keep_intermediate_states: false 
+        cache_clear_every_steps: 0 
+        use_expanded_window_tiles: true
+
+      guidance:
+        inner:
+          early_termination: true
+          cost_tolerance: 1e-5
+          gradient_tolerance: 1e-4
+          parameter_tolerance: 1e-6
+
+          # 原来的 10 对 inner_max_iters=1 完全不起作用
+          gradient_tolerance_start_step: 1
+
+        post:
+          early_termination: true
+          cost_tolerance: 1e-5
+          gradient_tolerance: 1e-4
+          parameter_tolerance: 1e-6
+
+          # post 最多 10 次，从第 2 次开始检查 gradient
+          gradient_tolerance_start_step: 2
+
+      constraint_optimization:
+        enabled: true
+
+        # 50 步里最后 24 步，每 3 步执行一次，共约 8 次
+        # 保持和当前 80/10 大致相同的 inner 触发次数
+        inner_max_iters: 1
+        inner_last_steps: 6
+        inner_step_frequency: 3
+
+        # 最终完整修正一次，通过 early termination 控制平均迭代数
+        post_max_iters: 8
+        post_last_steps: 0
+        post_step_frequency: 1
+        post_timing_repeat: 1
+        bucket_t: auto
+        detection_bucket: 0
+        warmup_before_segments: true
+
+        # 质量核心：保留手部约束
+        enable_hand_constraints: true
+
+        # 先关闭最容易慢/炸的约束
+        enable_foot_constraints: true
+        enable_collision_constraints: true
+
+        # 这个可以先 false；如果身体明显不稳，再改 true
+        enable_body_regularization: true
+
+      inference:
+        use_torch_compile: false
+
+      denoiser:
+        compile_model: false
   smooth:
     enabled: true
 

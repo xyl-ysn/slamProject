@@ -82,75 +82,6 @@ def load_head_trajectory(path: Path) -> np.ndarray:
     return poses
 
 
-def decide_scale(
-    head_poses: np.ndarray,
-    floor_z: float,
-    height_min: float,
-    height_max: float,
-    target_height: float | None,
-    force_scale: float | None,
-) -> tuple[float, dict]:
-    heights = head_poses[:, 2, 3] - float(floor_z)
-    median_height = float(np.median(heights))
-    invalid_median_height = (not np.isfinite(median_height)) or median_height <= 1e-8
-    warning = None
-
-    if invalid_median_height:
-        # Do not raise here. If the median head height is non-positive, the
-        # upstream gravity/floor alignment is suspicious, and any height-based
-        # scale would divide by zero/negative height. In this case, keep the
-        # original scale exactly as requested.
-        scale = 1.0
-        target = median_height
-        reason = "nonpositive_height_no_scaling"
-        warning = (
-            "Non-positive median head height detected; skip metric scaling and "
-            "continue with scale=1.0. Check gravity/floor alignment upstream. "
-            f"median_height={median_height:.9f}, floor_z={float(floor_z):.9f}."
-        )
-        if force_scale is not None:
-            warning += " force_scale is ignored because median head height is non-positive."
-        if target_height is not None:
-            warning += " target_height is ignored because median head height is non-positive."
-        print(f"[Warning] {warning}", flush=True)
-    elif force_scale is not None:
-        scale = float(force_scale)
-        reason = "force_scale"
-        target = median_height * scale
-    elif target_height is not None:
-        target = float(target_height)
-        scale = target / median_height
-        reason = "target_height"
-    elif median_height < height_min:
-        target = float(height_min)
-        scale = target / median_height
-        reason = "below_range"
-    elif median_height > height_max:
-        target = float(height_max)
-        scale = target / median_height
-        reason = "above_range"
-    else:
-        target = median_height
-        scale = 1.0
-        reason = "inside_range"
-
-    info = {
-        "reason": reason,
-        "warning": warning,
-        "invalid_median_height": bool(invalid_median_height),
-        "floor_z": float(floor_z),
-        "height_min": float(height_min),
-        "height_max": float(height_max),
-        "target_height": float(target),
-        "original_height_min": float(np.min(heights)),
-        "original_height_median": median_height,
-        "original_height_mean": float(np.mean(heights)),
-        "original_height_max": float(np.max(heights)),
-        "scale": float(scale),
-        "scaled_height_median": float(median_height * scale),
-    }
-    return scale, info
-
 def scale_world_points(points: np.ndarray, scale: float, floor_z: float) -> np.ndarray:
     points = np.asarray(points, dtype=np.float64)
     anchor = np.array([0.0, 0.0, float(floor_z)], dtype=np.float64)
@@ -426,6 +357,11 @@ def transform_and_scale_point_cloud(
         raise RuntimeError(f"Empty point cloud: {input_path}")
 
     points_before = int(len(pcd.points))
+    if float(output_voxel_size) < 0:
+        raise ValueError("--final-scene-output-voxel-size must be >= 0")
+    if float(output_voxel_size) > 0:
+        pcd = pcd.voxel_down_sample(float(output_voxel_size))
+
     points = np.asarray(pcd.points, dtype=np.float64)
     normals = np.asarray(pcd.normals, dtype=np.float64) if pcd.has_normals() else None
 
@@ -447,11 +383,6 @@ def transform_and_scale_point_cloud(
         pcd_out.colors = pcd.colors
     if normals is not None:
         pcd_out.normals = o3d.utility.Vector3dVector(normals)
-
-    if float(output_voxel_size) < 0:
-        raise ValueError("--final-scene-output-voxel-size must be >= 0")
-    if float(output_voxel_size) > 0:
-        pcd_out = pcd_out.voxel_down_sample(float(output_voxel_size))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     o3d.io.write_point_cloud(str(output_path), pcd_out)
@@ -815,6 +746,61 @@ def cap_hand_scale_by_head_p90(
         "head_p90_cap_warning": (
             f"hand scale capped from {float(scale):.9f} to {float(capped_scale):.9f} "
             f"because scaled p90 head height {scaled_p90:.6f}m exceeds {max_p90:.6f}m"
+        ),
+    })
+    return float(capped_scale), info
+
+
+def cap_moge_scale_by_head_stat(
+    scale: float,
+    info: dict,
+    head_poses: np.ndarray,
+    floor_z: float,
+    args: argparse.Namespace,
+) -> tuple[float, dict]:
+    info = dict(info)
+    info["head_height_sanity_policy"] = "cap_high_stat_only"
+    info["max_valid_head_height"] = float(args.scale_sanity_max_valid_head_height)
+    info["capped_by_head_height_stat"] = False
+    info["scale_before_head_height_cap"] = float(scale)
+
+    if not bool(args.scale_sanity_enabled):
+        return float(scale), info
+
+    heights = _finite_head_heights(head_poses, floor_z)
+    if heights.size == 0:
+        info["head_height_cap_warning"] = "no_finite_head_heights"
+        return float(scale), info
+
+    original_stat, stat_name = _stat_value(
+        heights,
+        args.scale_sanity_statistic,
+        args.scale_sanity_percentile,
+    )
+    info["original_head_height_stat_for_cap"] = original_stat
+    info["head_height_cap_statistic"] = stat_name
+    if original_stat is None or not np.isfinite(original_stat) or float(original_stat) <= 1e-8:
+        info["head_height_cap_warning"] = "invalid_original_head_height_stat"
+        return float(scale), info
+
+    max_h = float(args.scale_sanity_max_valid_head_height)
+    if not np.isfinite(max_h) or max_h <= 0:
+        info["head_height_cap_warning"] = "invalid_max_valid_head_height"
+        return float(scale), info
+
+    scaled_stat = float(original_stat) * float(scale)
+    info["scaled_head_height_stat_before_cap"] = scaled_stat
+    if scaled_stat <= max_h:
+        return float(scale), info
+
+    capped_scale = max_h / float(original_stat)
+    info.update({
+        "scale": float(capped_scale),
+        "capped_by_head_height_stat": True,
+        "scaled_head_height_stat_after_cap": float(max_h),
+        "head_height_cap_warning": (
+            f"MoGe scale capped from {float(scale):.9f} to {float(capped_scale):.9f} "
+            f"because scaled {stat_name} head height {scaled_stat:.6f}m exceeds {max_h:.6f}m"
         ),
     })
     return float(capped_scale), info
@@ -1210,9 +1196,6 @@ def try_height_scale(args: argparse.Namespace, head_poses: np.ndarray) -> tuple[
         "statistic": str(args.height_fallback_statistic),
         "percentile": float(args.height_fallback_percentile),
         "target_height": None,
-        "height_min": float(args.height_min),
-        "height_max": float(args.height_max),
-        "force_scale": float(args.force_scale) if args.force_scale is not None else None,
         "num_frames": int(heights_all.size),
         "min_valid_height": float(args.height_fallback_min_valid_height),
         "max_valid_height": float(args.height_fallback_max_valid_height),
@@ -1228,24 +1211,6 @@ def try_height_scale(args: argparse.Namespace, head_poses: np.ndarray) -> tuple[
     if heights_all.size == 0:
         info["reason"] = "no_finite_head_heights"
         return None, info
-
-    if args.force_scale is not None:
-        scale = float(args.force_scale)
-        if not np.isfinite(scale) or scale <= 0:
-            info.update({"reason": "invalid_force_scale", "scale": scale})
-            return None, info
-        if scale < float(args.height_fallback_min_scale) or scale > float(args.height_fallback_max_scale):
-            info.update({"reason": "force_scale_out_of_range", "scale": scale})
-            return None, info
-        info.update({
-            "status": "ok",
-            "reason": "force_scale",
-            "scale": scale,
-            "scale_method": "manual_force_scale",
-            "target_height": None,
-            **height_diagnostics(head_poses, args.floor_z, scale),
-        })
-        return scale, info
 
     # Optional smoothing only for selecting the standing-height statistic. The
     # original unsmoothed heights are still reported in diagnostics.
@@ -1285,10 +1250,8 @@ def try_height_scale(args: argparse.Namespace, head_poses: np.ndarray) -> tuple[
 
     target_height = args.height_fallback_target_height
     if target_height is None:
-        target_height = args.target_height
-    if target_height is None:
-        # Default to the midpoint of the configured normal range.
-        target_height = 0.5 * (float(args.height_min) + float(args.height_max))
+        info.update({"reason": "missing_height_fallback_target_height", "target_height": None})
+        return None, info
     target_height = float(target_height)
 
     if not np.isfinite(target_height) or target_height <= 0:
@@ -1354,6 +1317,14 @@ def decide_scale_by_priority(args: argparse.Namespace, head_poses: np.ndarray) -
                 attempts.append(info)
                 continue
 
+            scale, info = cap_moge_scale_by_head_stat(
+                scale,
+                info,
+                head_poses,
+                args.floor_z,
+                args,
+            )
+
             ok, sanity = validate_candidate_scale(
                 source="moge",
                 scale=scale,
@@ -1382,11 +1353,11 @@ def decide_scale_by_priority(args: argparse.Namespace, head_poses: np.ndarray) -
                 "attempts": attempts,
                 "moge": info,
                 "sanity": sanity,
-                "height_min": float(args.height_min),
-                "height_max": float(args.height_max),
-                "target_height": None,
-                "warning": sanity.get("warning"),
+                "target_height": None if not info.get("capped_by_head_height_stat") else float(args.scale_sanity_max_valid_head_height),
+                "warning": info.get("head_height_cap_warning") or sanity.get("warning"),
             })
+            if info.get("head_height_cap_warning"):
+                print(f"[Warning] {info.get('head_height_cap_warning')}", flush=True)
             return float(scale), diag
 
         elif source == "hands":
@@ -1426,8 +1397,6 @@ def decide_scale_by_priority(args: argparse.Namespace, head_poses: np.ndarray) -
                 "attempts": attempts,
                 "hands": info,
                 "hand_head_height_policy": "trust_hands_cap_high_p90",
-                "height_min": float(args.height_min),
-                "height_max": float(args.height_max),
                 "target_height": None if not info.get("capped_by_head_p90") else float(args.hand_max_p90_head_height),
                 "warning": info.get("head_p90_cap_warning"),
             })
@@ -1459,8 +1428,6 @@ def decide_scale_by_priority(args: argparse.Namespace, head_poses: np.ndarray) -
                 "scale_method": "no_scale_warning",
                 "priority": priority,
                 "attempts": attempts,
-                "height_min": float(args.height_min),
-                "height_max": float(args.height_max),
                 "target_height": None,
                 "warning": "No valid metric scale source; continue with scale=1.0.",
             })
@@ -1478,8 +1445,6 @@ def decide_scale_by_priority(args: argparse.Namespace, head_poses: np.ndarray) -
         "scale_method": "no_scale_warning",
         "priority": priority,
         "attempts": attempts,
-        "height_min": float(args.height_min),
-        "height_max": float(args.height_max),
         "target_height": None,
         "warning": "Scale priority exhausted; continue with scale=1.0.",
     })
@@ -1528,20 +1493,6 @@ def main() -> None:
 
     # Metric-scale parameters. These are normally read from YAML by run_body_mesh.py.
     parser.add_argument("--floor-z", type=float, default=0.0)
-    parser.add_argument("--height-min", type=float, default=1.50)
-    parser.add_argument("--height-max", type=float, default=1.60)
-    parser.add_argument(
-        "--target-height",
-        type=float,
-        default=None,
-        help="If set, scale median head height exactly to this value.",
-    )
-    parser.add_argument(
-        "--force-scale",
-        type=float,
-        default=None,
-        help="If set, skip height-range logic and apply this scale when scale_priority includes height.",
-    )
     parser.add_argument(
         "--scale-priority",
         default="hands,moge,height,none",
@@ -1673,7 +1624,6 @@ def main() -> None:
     print(f"point_cloud_in: {args.point_cloud_in}")
     print(f"hamer_pkl_in: {args.hamer_pkl_in}")
     print(f"floor_z: {args.floor_z:.6f}")
-    print(f"normal height range: [{args.height_min:.3f}, {args.height_max:.3f}]")
     orig_med = scale_info.get("original_height_median")
     if orig_med is not None:
         print(f"original median head height: {float(orig_med):.6f}")
